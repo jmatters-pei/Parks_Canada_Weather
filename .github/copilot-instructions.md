@@ -35,3 +35,6 @@ Annoted code is preferred for clarity and to mentor junior data scientists. Avoi
 - Ensure that all code is well-commented to facilitate understanding and collaboration among team members. 
 - at the end of each script, include a summary of the results obtained from that step and any next steps to be taken in the analysis pipeline.
 - at the end of each implementation, include a markdown file in the /plan/ directory summarizing what was done in that step, any challenges faced, and how they were overcome. This will help in maintaining a clear record of the analysis process and decisions made along the way. and will be useful for the next agent to create the next step in the pipeline. This document will also be used as the contract for the next agent to create the next step in the pipeline.
+
+
+The planing AI can only write to the /plan/ directory, and the implementation AI can only write to the /src/ directory. The planning AI will create markdown files that outline the analysis plan and findings, while the implementation AI will create Python scripts that execute the data preparation steps. Each step in the pipeline should be clearly documented in both the code and the markdown files to ensure clarity and facilitate collaboration among team members.
