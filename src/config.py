@@ -13,8 +13,11 @@ SCRUBBED_DIR = DATA_DIR / "scrubbed"
 MANIFEST_DIR = SCRUBBED_DIR / "_manifests"
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 FIGURES_DIR = OUTPUTS_DIR / "figures"
+LOGS_DIR = OUTPUTS_DIR / "logs"
 
 ECCC_CACHE_DIR = RAW_DIR / "ECCC_Stanhope"
+ECCC_STANHOPE_CLIMATE_ID = 8300590
+ECCC_STANHOPE_NAME = "Stanhope"
 
 # HOBOlink data are manually dropped in these station folders.
 HOBOLINK_STATIONS: List[str] = [
@@ -41,6 +44,7 @@ def ensure_directories() -> None:
         MANIFEST_DIR,
         OUTPUTS_DIR,
         FIGURES_DIR,
+        LOGS_DIR,
         ECCC_CACHE_DIR,
     ]
     for directory in required_dirs:
@@ -52,13 +56,27 @@ def get_hobolink_dropzones() -> Dict[str, Path]:
     return {station: RAW_DIR / station for station in HOBOLINK_STATIONS}
 
 
-def setup_logging(script_name: str) -> logging.Logger:
+def setup_logging(script_name: str, log_file_path: Path | None = None) -> logging.Logger:
     """Configure and return a standard logger for pipeline scripts."""
     logger = logging.getLogger(script_name)
-    if not logger.handlers:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    if log_file_path is not None:
+        log_file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    logger.propagate = False
     return logger
