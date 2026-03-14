@@ -13,6 +13,7 @@ SCRUBBED_DIR = DATA_DIR / "scrubbed"
 MANIFEST_DIR = SCRUBBED_DIR / "_manifests"
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 FIGURES_DIR = OUTPUTS_DIR / "figures"
+TABLES_DIR = OUTPUTS_DIR / "tables"
 LOGS_DIR = OUTPUTS_DIR / "logs"
 
 ECCC_CACHE_DIR = RAW_DIR / "ECCC_Stanhope"
@@ -44,6 +45,7 @@ def ensure_directories() -> None:
         MANIFEST_DIR,
         OUTPUTS_DIR,
         FIGURES_DIR,
+        TABLES_DIR,
         LOGS_DIR,
         ECCC_CACHE_DIR,
     ]
