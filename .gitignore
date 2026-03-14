@@ -3,5 +3,8 @@
 /outputs/
 /plan/
 
+# Ignore new plans directory
+/plans/
+
 # Ignore Python virtual environment
 .venv/
