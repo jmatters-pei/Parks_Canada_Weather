@@ -1,0 +1,7 @@
+# Ignore data, outputs, and plan directories
+/data/
+/outputs/
+/plan/
+
+# Ignore Python virtual environment
+.venv/
