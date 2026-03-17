@@ -65,6 +65,29 @@ MONTH_LABELS = {
     12: "dec",
 }
 
+WEST_TO_EAST_STATIONS = [
+    "Stanley_Bridge_Wharf",
+    "Cavendish",
+    "North_Rustico_Wharf",
+    "Stanhope",
+    "Tracadie_Wharf",
+    "Greenwich",
+]
+
+
+def _ordered_station_categories(values: Iterable[object]) -> List[str]:
+    present = {str(value) for value in values if pd.notna(value)}
+    ordered_known = [station for station in WEST_TO_EAST_STATIONS if station in present]
+    ordered_unknown = sorted(present - set(WEST_TO_EAST_STATIONS))
+    return ordered_known + ordered_unknown
+
+
+def _apply_station_order(df: pd.DataFrame, column: str = "station_slug") -> pd.DataFrame:
+    out = df.copy()
+    categories = _ordered_station_categories(out[column].tolist())
+    out[column] = pd.Categorical(out[column], categories=categories, ordered=True)
+    return out
+
 
 def _required_columns() -> List[str]:
     columns = ["datetime_utc", "station_slug", "station_raw", "source"] + ALL_VARS
@@ -101,6 +124,7 @@ def load_hourly_dataset(path: Path) -> pd.DataFrame:
         df[f"{var}_failed_qc"] = df[f"{var}_failed_qc"].fillna(False).astype(bool)
         df[f"{var}_filled_short_gap"] = df[f"{var}_filled_short_gap"].fillna(False).astype(bool)
 
+    df = _apply_station_order(df, "station_slug")
     df = df.sort_values(["station_slug", "datetime_utc"]).reset_index(drop=True)
     return df
 
@@ -170,7 +194,8 @@ def build_coverage_monthly(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _plot_missingness_heatmap(coverage_overall: pd.DataFrame, output_path: Path) -> None:
-    heat = coverage_overall.pivot(index="station_slug", columns="variable", values="missing_pct")
+    ordered = _apply_station_order(coverage_overall, "station_slug")
+    heat = ordered.pivot(index="station_slug", columns="variable", values="missing_pct")
     plt.figure(figsize=(11, 6))
     sns.heatmap(heat, annot=True, fmt=".1f", cmap="YlOrRd", cbar_kws={"label": "Missing (%)"})
     plt.title("Station Missingness by Variable")
@@ -183,6 +208,7 @@ def _plot_missingness_heatmap(coverage_overall: pd.DataFrame, output_path: Path)
 
 def _plot_missingness_timeline(coverage_monthly: pd.DataFrame, output_path: Path) -> None:
     subset = coverage_monthly[coverage_monthly["variable"].isin(CORE_VARS)].copy()
+    subset = _apply_station_order(subset, "station_slug")
     subset["month_dt"] = pd.to_datetime(subset["year_month"] + "-01", utc=True, errors="coerce")
 
     fig, axes = plt.subplots(len(CORE_VARS), 1, figsize=(12, 10), sharex=True)
@@ -196,6 +222,7 @@ def _plot_missingness_timeline(coverage_monthly: pd.DataFrame, output_path: Path
             x="month_dt",
             y="missing_pct",
             hue="station_slug",
+            hue_order=_ordered_station_categories(var_df["station_slug"].tolist()),
             marker="o",
             linewidth=1.2,
             ax=axis,
@@ -212,12 +239,19 @@ def _plot_missingness_timeline(coverage_monthly: pd.DataFrame, output_path: Path
 
 
 def _plot_distributions(df: pd.DataFrame, output_path: Path) -> None:
+    ordered_df = _apply_station_order(df, "station_slug")
     fig, axes = plt.subplots(1, len(CORE_VARS), figsize=(16, 6), sharex=False)
     if len(CORE_VARS) == 1:
         axes = [axes]
 
     for axis, variable in zip(axes, CORE_VARS):
-        sns.boxplot(data=df, x="station_slug", y=variable, ax=axis)
+        sns.boxplot(
+            data=ordered_df,
+            x="station_slug",
+            y=variable,
+            order=_ordered_station_categories(ordered_df["station_slug"].tolist()),
+            ax=axis,
+        )
         axis.set_title(f"Distribution: {variable}")
         axis.set_xlabel("Station")
         axis.set_ylabel(variable)
@@ -247,13 +281,22 @@ def _select_summer_month(df: pd.DataFrame) -> Tuple[int, int]:
 def _plot_summer_timeseries(df: pd.DataFrame, output_path: Path) -> Tuple[int, int]:
     year, month = _select_summer_month(df)
     subset = df[(df["datetime_utc"].dt.year == year) & (df["datetime_utc"].dt.month == month)].copy()
+    subset = _apply_station_order(subset, "station_slug")
 
     fig, axes = plt.subplots(len(CORE_VARS), 1, figsize=(14, 10), sharex=True)
     if len(CORE_VARS) == 1:
         axes = [axes]
 
     for axis, variable in zip(axes, CORE_VARS):
-        sns.lineplot(data=subset, x="datetime_utc", y=variable, hue="station_slug", linewidth=0.9, ax=axis)
+        sns.lineplot(
+            data=subset,
+            x="datetime_utc",
+            y=variable,
+            hue="station_slug",
+            hue_order=_ordered_station_categories(subset["station_slug"].tolist()),
+            linewidth=0.9,
+            ax=axis,
+        )
         axis.set_title(f"{variable} overlay for {year}-{month:02d}")
         axis.set_ylabel(variable)
         axis.grid(alpha=0.25)
@@ -267,7 +310,7 @@ def _plot_summer_timeseries(df: pd.DataFrame, output_path: Path) -> Tuple[int, i
 
 
 def _plot_wind_roses(df: pd.DataFrame, output_path: Path) -> None:
-    stations = sorted(df["station_slug"].dropna().unique().tolist())
+    stations = _ordered_station_categories(df["station_slug"].dropna().tolist())
     if not stations:
         return
 
@@ -376,18 +419,27 @@ def build_noon_readiness(df: pd.DataFrame) -> pd.DataFrame:
             }
         )
 
-    return pd.DataFrame(rows).sort_values("station_slug").reset_index(drop=True)
+    out = pd.DataFrame(rows)
+    out = _apply_station_order(out, "station_slug")
+    return out.sort_values("station_slug").reset_index(drop=True)
 
 
 def _plot_noon_readiness(noon_readiness: pd.DataFrame, output_path: Path) -> None:
-    plot_df = noon_readiness.melt(
+    ordered = _apply_station_order(noon_readiness, "station_slug")
+    plot_df = ordered.melt(
         id_vars=["station_slug"],
         value_vars=["noon_core_ready_pct", "precip_ready_24h_pct"],
         var_name="metric",
         value_name="pct",
     )
     plt.figure(figsize=(10, 6))
-    sns.barplot(data=plot_df, x="station_slug", y="pct", hue="metric")
+    sns.barplot(
+        data=plot_df,
+        x="station_slug",
+        y="pct",
+        hue="metric",
+        order=_ordered_station_categories(plot_df["station_slug"].tolist()),
+    )
     plt.ylabel("Readiness (%)")
     plt.xlabel("Station")
     plt.title("Local-Noon FWI Readiness (America/Halifax)")
@@ -573,9 +625,11 @@ def _corr_matrix(df: pd.DataFrame, variable: str, min_periods: int = MIN_PAIRWIS
     wide = (
         df[["datetime_utc", "station_slug", variable]]
         .pivot(index="datetime_utc", columns="station_slug", values=variable)
-        .sort_index(axis=1)
     )
-    return wide.corr(min_periods=min_periods)
+    station_order = _ordered_station_categories(wide.columns.tolist())
+    wide = wide.reindex(columns=station_order)
+    matrix = wide.corr(min_periods=min_periods)
+    return matrix.reindex(index=station_order, columns=station_order)
 
 
 def _plot_corr_heatmap(matrix: pd.DataFrame, title: str, output_path: Path) -> None:
