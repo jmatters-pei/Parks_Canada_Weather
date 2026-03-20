@@ -17,8 +17,17 @@ TABLES_DIR = OUTPUTS_DIR / "tables"
 LOGS_DIR = OUTPUTS_DIR / "logs"
 
 ECCC_CACHE_DIR = RAW_DIR / "ECCC_Stanhope"
+ECCC_FWI_CACHE_DIR = RAW_DIR / "ECCC_Stanhope_FWI"
 ECCC_STANHOPE_CLIMATE_ID = 8300590
 ECCC_STANHOPE_NAME = "Stanhope"
+ECCC_STANHOPE_FWI_ID = ECCC_STANHOPE_CLIMATE_ID
+
+# Primary daily FWI attempt uses ECCC climate bulk daily timeframe.
+ECCC_FWI_DAILY_BASE_URL = "https://climate.weather.gc.ca/climate_data/bulk_data_e.html"
+
+# Optional fallback endpoint template for CWFIS/NFP station outputs.
+# Supports placeholders: {station_id}, {year}
+CWFIS_FWI_DAILY_URL_TEMPLATE = ""
 
 # HOBOlink data are manually dropped in these station folders.
 HOBOLINK_STATIONS: List[str] = [
@@ -48,6 +57,7 @@ def ensure_directories() -> None:
         TABLES_DIR,
         LOGS_DIR,
         ECCC_CACHE_DIR,
+        ECCC_FWI_CACHE_DIR,
     ]
     for directory in required_dirs:
         directory.mkdir(parents=True, exist_ok=True)

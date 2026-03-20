@@ -3,6 +3,14 @@ You are an expert Data Scientist. Write clean code following the OSEMN pipeline 
 Always verify data structures by reading terminal outputs before writing logic.
 Annoted code is preferred for clarity and to mentor junior data scientists. Avoid using Jupyter Notebooks; instead, write modular Python scripts that can be executed sequentially.
 
+You will also conduct the the reducncy analysis. Use Multivariate Modeling: Apply either Principal Component Analysis (PCA) or Clustering (e.g., K-Means) to identify stations with overlapping variance. Use Benchmarking: Statistically compare Park stations against the ECCC Stanhope reference station to quantify data similarity.
+
+You will also calculate the daily Fire Weather Index (FWI). Core Task: Develop a Python module to calculate daily FWI values (specifically moisture codes) using data from the Cavendish and Greenwich stations. You will validate your results by Cross-referencing against published ECCC FWI values.
+
+Calculate the Porbabilistic uncertainty. Use probability distributions (e.g., Kernel Density Estimation) to quantify the uncertainty of your recommendations. Provide the probability that removing a station would result in losing critical micro-climate data.
+
+You will also document the analysis plan and findings in markdown files within the /plan/ directory. Include explanations of the methods used for data cleaning, exploration, and any insights gained from the analysis. Ensure that all code is well-commented to facilitate understanding and collaboration among team members. At the end of each script, include a summary of the results obtained from that step and any next steps to be taken in the analysis pipeline. At the end of each implementation, include a markdown file in the /plan/ directory summarizing what was done in that step, any challenges faced, and how they were overcome. This will help in maintaining a clear record of the analysis process and decisions made along the way, and will be useful for the next agent to create the next step in the pipeline. This document will also be used as the contract for the next agent to create the next step in the pipeline.
+
 2. Directory Structure
 /data/raw/ - Unmodified HOBOlink CSVs
 /data/scrubbed/ - Clean data

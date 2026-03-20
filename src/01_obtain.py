@@ -18,8 +18,12 @@ import requests
 
 from config import (
     ECCC_CACHE_DIR,
+    ECCC_FWI_CACHE_DIR,
+    ECCC_FWI_DAILY_BASE_URL,
     ECCC_STANHOPE_CLIMATE_ID,
+    ECCC_STANHOPE_FWI_ID,
     ECCC_STANHOPE_NAME,
+    CWFIS_FWI_DAILY_URL_TEMPLATE,
     LOGS_DIR,
     MANIFEST_DIR,
     get_hobolink_dropzones,
@@ -60,6 +64,7 @@ STATUS_FAILED_DOWNLOAD = "failed_download"
 
 HOBOLINK_MANIFEST = MANIFEST_DIR / "obtain_hobolink_files.csv"
 ECCC_MANIFEST = MANIFEST_DIR / "obtain_eccc_periods.csv"
+ECCC_FWI_MANIFEST = MANIFEST_DIR / "obtain_eccc_fwi_daily_periods.csv"
 SCHEMA_INVENTORY = MANIFEST_DIR / "schema_inventory.csv"
 
 CSV_MIME_HINTS = (
@@ -72,6 +77,7 @@ CSV_MIME_HINTS = (
 )
 
 READ_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
+FWI_REQUIRED_COLUMNS = ("ffmc", "dmc", "dc", "isi", "bui", "fwi")
 
 
 def utc_now_iso() -> str:
@@ -253,10 +259,34 @@ def validate_timestamp_columns(source: str, columns: List[str]) -> None:
             raise ValueError("HOBOlink file is missing required Date and/or Time columns.")
         return
 
+    if source == "eccc_fwi_daily":
+        has_date_like = any("date" in column for column in lower_columns)
+        if not has_date_like:
+            raise ValueError("FWI daily file is missing a required date-like column.")
+        return
+
     has_datetime = any("date/time" in column for column in lower_columns)
     has_date_and_time = "date" in lower_columns and "time" in lower_columns
     if not has_datetime and not has_date_and_time:
         raise ValueError("ECCC file is missing a Date/Time-equivalent timestamp column.")
+
+
+def validate_required_fwi_columns(columns: List[str]) -> None:
+    """Require daily FWI outputs to include date plus six official code columns."""
+    normalized = [re.sub(r"[^a-z0-9]+", "", column.lower()) for column in columns]
+    has_date = any("date" in column for column in normalized)
+    if not has_date:
+        raise ValueError("FWI daily file is missing required date column.")
+
+    missing = [
+        code.upper()
+        for code in FWI_REQUIRED_COLUMNS
+        if not any(column == code or column.startswith(code) for column in normalized)
+    ]
+    if missing:
+        raise ValueError(
+            "FWI daily file missing required FWI code columns: " + ", ".join(missing)
+        )
 
 
 def inspect_csv_schema(csv_path: Path, source: str) -> Tuple[str, Optional[str], Optional[str], Optional[List[str]]]:
@@ -267,6 +297,8 @@ def inspect_csv_schema(csv_path: Path, source: str) -> Tuple[str, Optional[str],
     try:
         _, columns = detect_header_and_columns(csv_path)
         validate_timestamp_columns(source, columns)
+        if source == "eccc_fwi_daily":
+            validate_required_fwi_columns(columns)
         return STATUS_OK, None, schema_hash_from_columns(columns), columns
     except Exception as exc:  # noqa: BLE001
         return STATUS_FAILED_READ, str(exc), None, None
@@ -458,7 +490,19 @@ def response_looks_like_csv(response: requests.Response) -> bool:
     if "," not in first_line:
         return False
 
-    csv_markers = ("date/time", "station name", "year", "month", "day")
+    csv_markers = (
+        "date/time",
+        "station name",
+        "year",
+        "month",
+        "day",
+        "ffmc",
+        "dmc",
+        "dc",
+        "isi",
+        "bui",
+        "fwi",
+    )
     marker_hits = sum(marker in probe_head.lower() for marker in csv_markers)
     return marker_hits >= 2
 
@@ -506,6 +550,141 @@ def build_eccc_url(climate_id: int, year: int, month: Optional[int]) -> str:
     if month is None:
         return base
     return f"{base}&Month={month}&Day=1"
+
+
+def build_eccc_fwi_daily_url(station_id: int | str, year: int) -> str:
+    """Build ECCC daily bulk URL for annual FWI cache attempts."""
+    return (
+        f"{ECCC_FWI_DAILY_BASE_URL}?format=csv&climate_id={station_id}"
+        f"&Year={year}&timeframe=2"
+    )
+
+
+def build_cwfis_fwi_daily_url(station_id: int | str, year: int) -> Optional[str]:
+    """Build optional fallback CWFIS/NFP URL from configured template."""
+    if not CWFIS_FWI_DAILY_URL_TEMPLATE.strip():
+        return None
+    return CWFIS_FWI_DAILY_URL_TEMPLATE.format(station_id=station_id, year=year)
+
+
+def download_eccc_fwi_daily_periods(
+    *,
+    station_name: str,
+    station_id: int | str,
+    start_year: int,
+    end_year: int,
+    latest_index: Dict[str, Dict[str, object]],
+    logger,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    """Download or validate annual daily FWI files with optional fallback endpoint."""
+    manifest_rows: List[Dict[str, object]] = []
+    schema_rows: List[Dict[str, object]] = []
+
+    def _attempt_download(year: int, destination: Path) -> Tuple[str, int, str, Optional[str], Optional[str], Optional[List[str]]]:
+        schema_failure_seen = False
+        last_error: Optional[str] = None
+
+        sources: List[Tuple[str, Optional[str]]] = [
+            ("eccc", build_eccc_fwi_daily_url(station_id=station_id, year=year)),
+            ("cwfis", build_cwfis_fwi_daily_url(station_id=station_id, year=year)),
+        ]
+
+        for source_name, url in sources:
+            if not url:
+                continue
+
+            try:
+                download_to_file_atomic(url=url, destination=destination)
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"{source_name} download failed: {exc}"
+                logger.warning("FWI %s download failed for %s: %s", source_name, year, exc)
+                continue
+
+            size_bytes = destination.stat().st_size
+            sha256_value = compute_sha256(destination)
+            schema_status, error_message, schema_hash, columns = inspect_csv_schema(
+                destination,
+                "eccc_fwi_daily",
+            )
+
+            if schema_status == STATUS_FAILED_READ:
+                schema_failure_seen = True
+                last_error = f"{source_name} schema invalid: {error_message}"
+                logger.warning(
+                    "FWI %s schema invalid for %s: %s",
+                    source_name,
+                    year,
+                    error_message,
+                )
+                if source_name == "eccc":
+                    logger.info("Trying fallback FWI source for %s after ECCC schema mismatch.", year)
+                continue
+
+            provenance = None if source_name == "eccc" else f"downloaded via {source_name} fallback"
+            return STATUS_DOWNLOADED, size_bytes, sha256_value, provenance, schema_hash, columns
+
+        if schema_failure_seen:
+            return STATUS_FAILED_READ, 0, "", last_error, None, None
+        return STATUS_FAILED_DOWNLOAD, 0, "", last_error, None, None
+
+    for year in range(start_year, end_year + 1):
+        period = str(year)
+        file_name = f"ECCC_{station_slug(station_name)}_{period}_daily_fwi.csv"
+        destination = ECCC_FWI_CACHE_DIR / file_name
+
+        if destination.exists():
+            size_bytes = destination.stat().st_size
+            unchanged, cached_hash = classify_unchanged(destination, latest_index)
+            if unchanged and cached_hash:
+                sha256_value = cached_hash
+                base_status = STATUS_SKIPPED_UNCHANGED
+            else:
+                sha256_value = compute_sha256(destination)
+                base_status = STATUS_OK
+
+            schema_status, error_message, schema_hash, columns = inspect_csv_schema(
+                destination,
+                "eccc_fwi_daily",
+            )
+            final_status = base_status if schema_status != STATUS_FAILED_READ else STATUS_FAILED_READ
+
+            if final_status == STATUS_FAILED_READ:
+                logger.info("Attempting FWI re-download for %s due to schema failure.", period)
+                final_status, size_bytes, sha256_value, error_message, schema_hash, columns = _attempt_download(
+                    year,
+                    destination,
+                )
+        else:
+            final_status, size_bytes, sha256_value, error_message, schema_hash, columns = _attempt_download(
+                year,
+                destination,
+            )
+
+        if schema_hash and columns:
+            schema_rows.append(
+                {
+                    "source": "eccc_fwi_daily",
+                    "schema_hash": schema_hash,
+                    "columns_json": json.dumps(columns, ensure_ascii=True),
+                }
+            )
+
+        manifest_rows.append(
+            create_manifest_row(
+                source="eccc_fwi_daily",
+                station_raw=station_name,
+                year=year,
+                period=period,
+                file_path=destination,
+                size_bytes=size_bytes,
+                sha256_value=sha256_value,
+                status=final_status,
+                error_message=error_message,
+                schema_hash=schema_hash,
+            )
+        )
+
+    return manifest_rows, schema_rows
 
 
 def download_eccc_periods(
@@ -630,8 +809,10 @@ def main() -> int:
 
     hobolink_history = load_manifest(HOBOLINK_MANIFEST)
     eccc_history = load_manifest(ECCC_MANIFEST)
+    eccc_fwi_history = load_manifest(ECCC_FWI_MANIFEST)
     hobolink_index = latest_manifest_index(hobolink_history)
     eccc_index = latest_manifest_index(eccc_history)
+    eccc_fwi_index = latest_manifest_index(eccc_fwi_history)
 
     hobolink_dropzones = get_hobolink_dropzones()
     hobolink_rows, hobolink_schema_rows, hobolink_years = discover_hobolink(
@@ -661,17 +842,30 @@ def main() -> int:
         logger=logger,
     )
 
+    eccc_fwi_rows, eccc_fwi_schema_rows = download_eccc_fwi_daily_periods(
+        station_name=ECCC_STANHOPE_NAME,
+        station_id=ECCC_STANHOPE_FWI_ID,
+        start_year=start_year,
+        end_year=end_year,
+        latest_index=eccc_fwi_index,
+        logger=logger,
+    )
+
     append_manifest_rows(HOBOLINK_MANIFEST, hobolink_rows)
     append_manifest_rows(ECCC_MANIFEST, eccc_rows)
-    update_schema_inventory(hobolink_schema_rows + eccc_schema_rows)
+    append_manifest_rows(ECCC_FWI_MANIFEST, eccc_fwi_rows)
+    update_schema_inventory(hobolink_schema_rows + eccc_schema_rows + eccc_fwi_schema_rows)
 
     hobolink_status = pd.Series([row["status"] for row in hobolink_rows]).value_counts().to_dict()
     eccc_status = pd.Series([row["status"] for row in eccc_rows]).value_counts().to_dict()
+    eccc_fwi_status = pd.Series([row["status"] for row in eccc_fwi_rows]).value_counts().to_dict()
 
     logger.info("Summary: HOBOlink files processed = %s", len(hobolink_rows))
     logger.info("Summary: HOBOlink statuses = %s", hobolink_status)
     logger.info("Summary: ECCC periods processed = %s", len(eccc_rows))
     logger.info("Summary: ECCC statuses = %s", eccc_status)
+    logger.info("Summary: ECCC FWI daily periods processed = %s", len(eccc_fwi_rows))
+    logger.info("Summary: ECCC FWI daily statuses = %s", eccc_fwi_status)
     logger.info(
         "Next steps: run 02_scrub.py for UTC normalization, missing-value handling, and hourly resampling."
     )
