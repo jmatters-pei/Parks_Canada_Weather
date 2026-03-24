@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Set
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
@@ -45,6 +45,36 @@ CANONICAL_VARIABLES: Dict[str, str] = {
     "wind_dir": "wind_direction_deg",
     "rain": "precipitation_mm",
 }
+
+# Shared season configuration.
+SEASON_BY_MONTH: Dict[int, str] = {
+    12: "winter",
+    1: "winter",
+    2: "winter",
+    3: "spring",
+    4: "spring",
+    5: "spring",
+    6: "summer",
+    7: "summer",
+    8: "summer",
+    9: "fall",
+    10: "fall",
+    11: "fall",
+}
+FWI_SEASON_MONTHS: Set[int] = {6, 7, 8, 9}
+
+# Phase 6 redundancy modeling defaults.
+BENCHMARK_REFERENCE_STATION_SLUG = "Stanhope"
+MIN_ALIGNED_HOURS_PER_WINDOW = 500
+MIN_COMPLETE_CASE_FRACTION = 0.55
+REDUNDANCY_RANDOM_SEED = 42
+REDUNDANCY_INCLUDE_WIND_DIRECTION_FEATURES = False
+REDUNDANCY_INCLUDE_LOG1P_PRECIP_SENSITIVITY = False
+
+
+def station_name_to_slug(station_name: str) -> str:
+    """Convert a station display name to the canonical slug used in scrubbed data."""
+    return station_name.strip().replace(" ", "_")
 
 
 def ensure_directories() -> None:
