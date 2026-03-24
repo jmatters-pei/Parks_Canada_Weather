@@ -7,14 +7,12 @@ import csv
 import hashlib
 import json
 import math
-import os
 import re
 import time
 import warnings
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -30,6 +28,18 @@ from config import (
     get_hobolink_dropzones,
     ensure_directories,
     setup_logging,
+)
+from obtain_utils import (
+    acquire_obtain_lock,
+    append_manifest_rows,
+    compute_sha256,
+    download_to_file_atomic,
+    latest_manifest_index,
+    load_manifest,
+    release_obtain_lock,
+    response_looks_like_csv,
+    update_schema_inventory,
+    utc_now_iso,
 )
 
 MANIFEST_COLUMNS = [
@@ -88,14 +98,11 @@ FWI_REQUEST_MAX_RETRIES = 3
 FWI_REQUEST_RETRY_BACKOFF_SECONDS = 2.0
 FWI_SEASON_START_MONTH = 6
 FWI_SEASON_START_DAY = 1
+FWI_SEASON_END_MONTH = 9
+FWI_SEASON_END_DAY = 30
 FFMC_START = 85.0
 DMC_START = 6.0
 DC_START = 15.0
-
-
-def utc_now_iso() -> str:
-    """Return UTC timestamp as ISO 8601 string."""
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def station_slug(station_name: str) -> str:
@@ -116,58 +123,6 @@ def schema_hash_from_columns(columns: List[str]) -> str:
     """Deterministically hash ordered column names."""
     payload = json.dumps({"columns": columns}, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def compute_sha256(file_path: Path, chunk_size: int = 1024 * 1024) -> str:
-    """Compute SHA256 for a file."""
-    hasher = hashlib.sha256()
-    with file_path.open("rb") as handle:
-        while True:
-            chunk = handle.read(chunk_size)
-            if not chunk:
-                break
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def load_manifest(manifest_path: Path) -> pd.DataFrame:
-    """Load a manifest or return an empty dataframe with standard columns."""
-    if manifest_path.exists():
-        return pd.read_csv(manifest_path)
-    return pd.DataFrame(columns=MANIFEST_COLUMNS)
-
-
-def append_manifest_rows(manifest_path: Path, rows: List[Dict[str, object]]) -> None:
-    """Append new rows to a manifest without dropping historical records."""
-    if not rows:
-        return
-
-    new_df = pd.DataFrame(rows)
-    for column in MANIFEST_COLUMNS:
-        if column not in new_df.columns:
-            new_df[column] = None
-    new_df = new_df[MANIFEST_COLUMNS]
-
-    if manifest_path.exists():
-        existing_df = pd.read_csv(manifest_path)
-        output_df = pd.concat([existing_df, new_df], ignore_index=True)
-    else:
-        output_df = new_df
-
-    output_df.to_csv(manifest_path, index=False)
-
-
-def latest_manifest_index(manifest_df: pd.DataFrame) -> Dict[str, Dict[str, object]]:
-    """Create a latest-by-file-path index for incremental checks."""
-    latest: Dict[str, Dict[str, object]] = {}
-    if manifest_df.empty:
-        return latest
-
-    for row in manifest_df.to_dict(orient="records"):
-        file_path = str(row.get("file_path", "")).strip()
-        if file_path:
-            latest[file_path] = row
-    return latest
 
 
 def _read_scanned_rows(
@@ -346,47 +301,6 @@ def create_manifest_row(
         "error_message": error_message,
         "schema_hash": schema_hash,
     }
-
-
-def update_schema_inventory(schema_records: List[Dict[str, object]]) -> None:
-    """Merge schema records into schema inventory while preserving history."""
-    if not schema_records:
-        return
-
-    now_utc = utc_now_iso()
-    new_df = pd.DataFrame(schema_records)
-    if new_df.empty:
-        return
-
-    grouped = (
-        new_df.groupby(["source", "schema_hash", "columns_json"], dropna=False)
-        .size()
-        .reset_index(name="seen_count")
-    )
-    grouped["first_seen_utc"] = now_utc
-    grouped["last_seen_utc"] = now_utc
-    grouped = grouped[SCHEMA_COLUMNS]
-
-    if SCHEMA_INVENTORY.exists():
-        existing = pd.read_csv(SCHEMA_INVENTORY)
-        for column in SCHEMA_COLUMNS:
-            if column not in existing.columns:
-                existing[column] = pd.NA
-        merged = pd.concat([existing[SCHEMA_COLUMNS], grouped], ignore_index=True)
-    else:
-        merged = grouped
-
-    merged = (
-        merged.groupby(["source", "schema_hash", "columns_json"], dropna=False)
-        .agg(
-            first_seen_utc=("first_seen_utc", "min"),
-            last_seen_utc=("last_seen_utc", "max"),
-            seen_count=("seen_count", "sum"),
-        )
-        .reset_index()
-    )
-    merged = merged[SCHEMA_COLUMNS]
-    merged.to_csv(SCHEMA_INVENTORY, index=False)
 
 
 def infer_hobolink_years(files: Iterable[Path]) -> List[int]:
@@ -616,57 +530,6 @@ def derive_hobolink_coverage_bounds(
         max_seen,
     )
     return min_seen, max_seen
-
-
-def response_looks_like_csv(response: requests.Response) -> bool:
-    """Quickly check if HTTP response appears to be CSV."""
-    content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
-    if "text/html" in content_type:
-        return False
-    if content_type and content_type not in CSV_MIME_HINTS:
-        # Fall back to content sniffing for non-standard download MIME types.
-        pass
-
-    probe = response.text.lstrip("\ufeff\n\r\t ")
-    probe_head = probe[:500]
-    if "<!doctype html" in probe_head.lower() or "<html" in probe_head.lower():
-        return False
-
-    first_line = probe_head.splitlines()[0] if probe_head.splitlines() else ""
-    if "," not in first_line:
-        return False
-
-    csv_markers = (
-        "date/time",
-        "station name",
-        "year",
-        "month",
-        "day",
-        "ffmc",
-        "dmc",
-        "dc",
-        "isi",
-        "bui",
-        "fwi",
-    )
-    marker_hits = sum(marker in probe_head.lower() for marker in csv_markers)
-    return marker_hits >= 2
-
-
-def download_to_file_atomic(url: str, destination: Path, timeout_seconds: int = 60) -> None:
-    """Download text content atomically via temp file then move into place."""
-    response = requests.get(url, timeout=timeout_seconds)
-    response.raise_for_status()
-
-    if not response_looks_like_csv(response):
-        raise ValueError("Response did not look like CSV payload.")
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile("w", delete=False, dir=destination.parent, encoding="utf-8", newline="") as tmp:
-        tmp.write(response.text)
-        temp_path = Path(tmp.name)
-
-    temp_path.replace(destination)
 
 
 def rh_from_dewpoint(temperature_c: float, dew_point_c: float) -> float:
@@ -978,6 +841,11 @@ def compute_fwi_daily_records(daily_inputs: Dict[str, Dict[str, float]]) -> List
     results: List[Dict[str, object]] = []
 
     for date_text in sorted(daily_inputs.keys()):
+        current_day = date.fromisoformat(date_text)
+        season_end = date(current_day.year, FWI_SEASON_END_MONTH, FWI_SEASON_END_DAY)
+        if current_day > season_end:
+            continue
+
         values = daily_inputs[date_text]
         month = int(date_text[5:7])
 
@@ -1006,6 +874,24 @@ def compute_fwi_daily_records(daily_inputs: Dict[str, Dict[str, float]]) -> List
         )
 
     return results
+
+
+def get_fwi_date_bounds(csv_path: Path) -> Optional[Tuple[date, date]]:
+    """Return min/max Date values from a computed daily FWI CSV, if available."""
+    try:
+        frame = pd.read_csv(csv_path, usecols=["Date"])
+    except Exception:  # noqa: BLE001
+        return None
+
+    if frame.empty:
+        return None
+
+    parsed = pd.to_datetime(frame["Date"], format="%Y-%m-%d", errors="coerce")
+    parsed = parsed.dropna()
+    if parsed.empty:
+        return None
+
+    return parsed.min().date(), parsed.max().date()
 
 
 def compute_stanhope_fwi_daily_file(
@@ -1084,6 +970,15 @@ def compute_stanhope_fwi_daily_file(
         writer.writeheader()
         writer.writerows(results)
 
+    output_min = results[0]["Date"]
+    output_max = results[-1]["Date"]
+    logger.info(
+        "Stanhope daily FWI date bounds for %s output: min(Date)=%s max(Date)=%s",
+        year,
+        output_min,
+        output_max,
+    )
+
     size_bytes = destination.stat().st_size
     sha256_value = compute_sha256(destination)
     schema_status, error_message, schema_hash, columns = inspect_csv_schema(destination, "eccc_fwi_daily")
@@ -1099,23 +994,6 @@ def compute_stanhope_fwi_daily_file(
     return STATUS_DOWNLOADED, size_bytes, sha256_value, None, schema_hash, columns
 
 
-def get_first_fwi_date(csv_path: Path) -> Optional[date]:
-    """Return first Date value from a computed daily FWI CSV, if available."""
-    try:
-        frame = pd.read_csv(csv_path, usecols=["Date"], nrows=1)
-    except Exception:  # noqa: BLE001
-        return None
-
-    if frame.empty:
-        return None
-
-    value = frame.iloc[0].get("Date")
-    try:
-        return datetime.strptime(str(value), "%Y-%m-%d").date()
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def get_eccc_download_mode(climate_id: int, probe_year: int, logger) -> str:
     """Prefer annual downloads when supported by endpoint, else use monthly."""
     annual_url = (
@@ -1124,7 +1002,7 @@ def get_eccc_download_mode(climate_id: int, probe_year: int, logger) -> str:
     )
     try:
         response = requests.get(annual_url, timeout=30)
-        if response.status_code == 200 and response_looks_like_csv(response):
+        if response.status_code == 200 and response_looks_like_csv(response, CSV_MIME_HINTS):
             logger.info("ECCC endpoint supports annual hourly download mode.")
             return "annual"
     except Exception as exc:  # noqa: BLE001
@@ -1165,9 +1043,8 @@ def download_eccc_fwi_daily_periods(
         destination = ECCC_FWI_CACHE_DIR / file_name
 
         year_start = date(year, FWI_SEASON_START_MONTH, FWI_SEASON_START_DAY)
-        year_end = date(year, 12, 31)
-        if year == end_year:
-            year_end = end_date
+        season_end = date(year, FWI_SEASON_END_MONTH, FWI_SEASON_END_DAY)
+        year_end = min(season_end, end_date)
 
         if year_end < year_start:
             error_message = (
@@ -1192,14 +1069,26 @@ def download_eccc_fwi_daily_periods(
 
         recompute_existing = False
         if destination.exists():
-            first_date = get_first_fwi_date(destination)
-            if first_date is None or first_date.month < FWI_SEASON_START_MONTH:
+            bounds = get_fwi_date_bounds(destination)
+            if bounds is None:
                 recompute_existing = True
                 logger.info(
-                    "Recomputing %s because cached daily FWI starts before seasonal window (%s).",
+                    "Recomputing %s because cached daily FWI has no valid Date bounds.",
                     destination.name,
-                    first_date,
                 )
+            else:
+                first_date, last_date = bounds
+                if first_date.month < FWI_SEASON_START_MONTH or last_date > season_end:
+                    recompute_existing = True
+                    logger.info(
+                        "Recomputing %s because cached daily FWI date bounds (%s to %s) "
+                        "violate seasonal window (%s to %s).",
+                        destination.name,
+                        first_date,
+                        last_date,
+                        year_start,
+                        season_end,
+                    )
 
         if destination.exists() and not recompute_existing:
             size_bytes = destination.stat().st_size
@@ -1301,7 +1190,11 @@ def download_eccc_periods(
         else:
             url = build_eccc_url(climate_id=climate_id, year=year, month=month)
             try:
-                download_to_file_atomic(url=url, destination=destination)
+                download_to_file_atomic(
+                    url=url,
+                    destination=destination,
+                    csv_mime_hints=CSV_MIME_HINTS,
+                )
                 size_bytes = destination.stat().st_size
                 sha256_value = compute_sha256(destination)
                 schema_status, error_message, schema_hash, columns = inspect_csv_schema(
@@ -1366,59 +1259,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def acquire_obtain_lock(lock_path: Path, logger) -> bool:
-    """Acquire a single-run lock so obtain is not executed concurrently."""
-    payload = {
-        "pid": os.getpid(),
-        "started_at_utc": utc_now_iso(),
-    }
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=True)
-        return True
-    except FileExistsError:
-        # Auto-recover stale lock from crashed or externally-killed process.
-        try:
-            stale = json.loads(lock_path.read_text(encoding="utf-8"))
-            stale_pid = int(stale.get("pid"))
-            if stale_pid > 0:
-                try:
-                    os.kill(stale_pid, 0)
-                except OSError:
-                    lock_path.unlink(missing_ok=True)
-                    logger.warning("Removed stale obtain lock from non-running pid %s.", stale_pid)
-                    return acquire_obtain_lock(lock_path, logger)
-        except Exception:  # noqa: BLE001
-            pass
-
-        details = ""
-        try:
-            stale = json.loads(lock_path.read_text(encoding="utf-8"))
-            details = f" Existing lock metadata: {stale}"
-        except Exception:  # noqa: BLE001
-            details = ""
-
-        logger.error(
-            "Another obtain run appears active because lock file exists at %s.%s",
-            lock_path,
-            details,
-        )
-        logger.error("If no run is active, remove the stale lock file and rerun obtain.")
-        return False
-
-
-def release_obtain_lock(lock_path: Path, logger) -> None:
-    """Release obtain run lock best-effort."""
-    try:
-        if lock_path.exists():
-            lock_path.unlink()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to remove obtain lock file %s: %s", lock_path, exc)
-
-
 def main() -> int:
     """Run local HOBOlink discovery and incremental ECCC downloads."""
     args = parse_args()
@@ -1434,9 +1274,9 @@ def main() -> int:
         logger.info("ECCC Stanhope climate identifier: %s", ECCC_STANHOPE_CLIMATE_ID)
         logger.info("Stanhope daily FWI source: computed locally from ECCC hourly API observations.")
 
-        hobolink_history = load_manifest(HOBOLINK_MANIFEST)
-        eccc_history = load_manifest(ECCC_MANIFEST)
-        eccc_fwi_history = load_manifest(ECCC_FWI_MANIFEST)
+        hobolink_history = load_manifest(HOBOLINK_MANIFEST, MANIFEST_COLUMNS)
+        eccc_history = load_manifest(ECCC_MANIFEST, MANIFEST_COLUMNS)
+        eccc_fwi_history = load_manifest(ECCC_FWI_MANIFEST, MANIFEST_COLUMNS)
         hobolink_index = latest_manifest_index(hobolink_history)
         eccc_index = latest_manifest_index(eccc_history)
         eccc_fwi_index = latest_manifest_index(eccc_fwi_history)
@@ -1494,10 +1334,14 @@ def main() -> int:
             logger=logger,
         )
 
-        append_manifest_rows(HOBOLINK_MANIFEST, hobolink_rows)
-        append_manifest_rows(ECCC_MANIFEST, eccc_rows)
-        append_manifest_rows(ECCC_FWI_MANIFEST, eccc_fwi_rows)
-        update_schema_inventory(hobolink_schema_rows + eccc_schema_rows + eccc_fwi_schema_rows)
+        append_manifest_rows(HOBOLINK_MANIFEST, hobolink_rows, MANIFEST_COLUMNS)
+        append_manifest_rows(ECCC_MANIFEST, eccc_rows, MANIFEST_COLUMNS)
+        append_manifest_rows(ECCC_FWI_MANIFEST, eccc_fwi_rows, MANIFEST_COLUMNS)
+        update_schema_inventory(
+            hobolink_schema_rows + eccc_schema_rows + eccc_fwi_schema_rows,
+            SCHEMA_INVENTORY,
+            SCHEMA_COLUMNS,
+        )
 
         hobolink_status = pd.Series([row["status"] for row in hobolink_rows]).value_counts().to_dict()
         eccc_status = pd.Series([row["status"] for row in eccc_rows]).value_counts().to_dict()
