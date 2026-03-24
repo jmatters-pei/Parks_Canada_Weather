@@ -15,6 +15,7 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 FIGURES_DIR = OUTPUTS_DIR / "figures"
 TABLES_DIR = OUTPUTS_DIR / "tables"
 LOGS_DIR = OUTPUTS_DIR / "logs"
+PLANS_DIR = PROJECT_ROOT / "plans"
 
 ECCC_CACHE_DIR = RAW_DIR / "ECCC_Stanhope"
 ECCC_FWI_CACHE_DIR = RAW_DIR / "ECCC_Stanhope_FWI"
@@ -71,6 +72,31 @@ REDUNDANCY_RANDOM_SEED = 42
 REDUNDANCY_INCLUDE_WIND_DIRECTION_FEATURES = False
 REDUNDANCY_INCLUDE_LOG1P_PRECIP_SENSITIVITY = False
 
+# Phase 7 interpretation defaults.
+INTERPRET_REFERENCE_STATION_SLUG = "Stanhope"
+INTERPRET_CANDIDATE_STATION_SLUGS: List[str] = ["Cavendish", "Greenwich"]
+
+INTERPRET_HOURLY_THRESHOLDS: Dict[str, float] = {
+    "air_temperature_c": 2.0,
+    "relative_humidity_pct": 5.0,
+    "wind_speed_kmh": 5.0,
+    "precipitation_mm": 1.0,
+}
+
+INTERPRET_DAILY_THRESHOLDS: Dict[str, float] = {
+    "precip_24h_sum_mm": 2.0,
+    "ffmc": 2.0,
+    "dmc": 5.0,
+    "dc": 15.0,
+}
+
+INTERPRET_ALPHA = 0.05
+INTERPRET_BOOTSTRAP_BLOCK_DAYS = 7
+INTERPRET_BOOTSTRAP_N_RESAMPLES = 1000
+INTERPRET_RANDOM_SEED = 42
+INTERPRET_MIN_ALIGNED_HOURLY_PER_WINDOW = 500
+INTERPRET_MIN_ALIGNED_DAILY_PER_WINDOW = 60
+
 
 def station_name_to_slug(station_name: str) -> str:
     """Convert a station display name to the canonical slug used in scrubbed data."""
@@ -86,6 +112,7 @@ def ensure_directories() -> None:
         FIGURES_DIR,
         TABLES_DIR,
         LOGS_DIR,
+        PLANS_DIR,
         ECCC_CACHE_DIR,
         ECCC_FWI_CACHE_DIR,
     ]
