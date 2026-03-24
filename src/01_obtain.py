@@ -6,9 +6,13 @@ import argparse
 import csv
 import hashlib
 import json
+import math
+import os
 import re
+import time
+import warnings
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -19,11 +23,8 @@ import requests
 from config import (
     ECCC_CACHE_DIR,
     ECCC_FWI_CACHE_DIR,
-    ECCC_FWI_DAILY_BASE_URL,
     ECCC_STANHOPE_CLIMATE_ID,
-    ECCC_STANHOPE_FWI_ID,
     ECCC_STANHOPE_NAME,
-    CWFIS_FWI_DAILY_URL_TEMPLATE,
     LOGS_DIR,
     MANIFEST_DIR,
     get_hobolink_dropzones,
@@ -66,6 +67,7 @@ HOBOLINK_MANIFEST = MANIFEST_DIR / "obtain_hobolink_files.csv"
 ECCC_MANIFEST = MANIFEST_DIR / "obtain_eccc_periods.csv"
 ECCC_FWI_MANIFEST = MANIFEST_DIR / "obtain_eccc_fwi_daily_periods.csv"
 SCHEMA_INVENTORY = MANIFEST_DIR / "schema_inventory.csv"
+OBTAIN_LOCK_PATH = LOGS_DIR / "01_obtain.lock"
 
 CSV_MIME_HINTS = (
     "text/csv",
@@ -78,6 +80,17 @@ CSV_MIME_HINTS = (
 
 READ_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 FWI_REQUIRED_COLUMNS = ("ffmc", "dmc", "dc", "isi", "bui", "fwi")
+FWI_API_BASE = "https://api.weather.gc.ca/collections/climate-hourly/items"
+FWI_PAGE_LIMIT = 500
+FWI_REQUEST_DELAY_SECONDS = 1.0
+FWI_REQUEST_TIMEOUT_SECONDS = 30
+FWI_REQUEST_MAX_RETRIES = 3
+FWI_REQUEST_RETRY_BACKOFF_SECONDS = 2.0
+FWI_SEASON_START_MONTH = 6
+FWI_SEASON_START_DAY = 1
+FFMC_START = 85.0
+DMC_START = 6.0
+DC_START = 15.0
 
 
 def utc_now_iso() -> str:
@@ -472,6 +485,139 @@ def discover_hobolink(
     return manifest_rows, schema_rows, years
 
 
+def status_is_usable(status: object) -> bool:
+    """Return True when a manifest status indicates readable data."""
+    if pd.isna(status):
+        return False
+    text = str(status).strip().lower()
+    if not text:
+        return False
+    return not text.startswith("failed_")
+
+
+def find_hobolink_datetime_columns(columns: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Identify combined or split date/time columns from normalized header names."""
+    lowered = {column.lower(): column for column in columns}
+
+    combined_candidates = [
+        "date/time",
+        "date time",
+        "datetime",
+        "timestamp",
+    ]
+    for candidate in combined_candidates:
+        if candidate in lowered:
+            return lowered[candidate], None, None
+
+    date_col = lowered.get("date")
+    time_col = lowered.get("time")
+    if date_col and time_col:
+        return None, date_col, time_col
+
+    return None, None, None
+
+
+def read_hobolink_datetime_bounds(csv_path: Path) -> Optional[Tuple[date, date]]:
+    """Read one HOBOlink CSV and return min/max observation dates found."""
+    header_row, columns = detect_header_and_columns(csv_path)
+    datetime_col, date_col, time_col = find_hobolink_datetime_columns(columns)
+    if datetime_col is None and (date_col is None or time_col is None):
+        return None
+
+    last_error: Optional[Exception] = None
+    for encoding in READ_ENCODINGS:
+        try:
+            df = pd.read_csv(
+                csv_path,
+                skiprows=header_row,
+                encoding=encoding,
+                engine="python",
+            )
+            df.columns = _normalize_header_columns([str(column) for column in df.columns])
+
+            if datetime_col and datetime_col in df.columns:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="Could not infer format, so each element will be parsed individually",
+                        category=UserWarning,
+                    )
+                    parsed = pd.to_datetime(df[datetime_col], errors="coerce", utc=True)
+            elif date_col and time_col and date_col in df.columns and time_col in df.columns:
+                combined = df[date_col].astype(str).str.strip() + " " + df[time_col].astype(str).str.strip()
+                parsed = pd.to_datetime(
+                    combined,
+                    errors="coerce",
+                    utc=True,
+                    format="mixed",
+                )
+            else:
+                return None
+
+            parsed = parsed.dropna()
+            if parsed.empty:
+                return None
+
+            min_date = parsed.min().date()
+            max_date = parsed.max().date()
+            return min_date, max_date
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            continue
+
+    if last_error is not None:
+        raise last_error
+    return None
+
+
+def derive_hobolink_coverage_bounds(
+    hobolink_rows: List[Dict[str, object]],
+    logger,
+) -> Optional[Tuple[date, date]]:
+    """Compute global min/max HOBOlink timestamps across usable files."""
+    min_seen: Optional[date] = None
+    max_seen: Optional[date] = None
+    scanned_files = 0
+
+    for row in hobolink_rows:
+        if not status_is_usable(row.get("status")):
+            continue
+        file_path_text = str(row.get("file_path", "")).strip()
+        if not file_path_text:
+            continue
+        csv_path = Path(file_path_text)
+        if not csv_path.exists() or csv_path.suffix.lower() != ".csv":
+            continue
+
+        try:
+            bounds = read_hobolink_datetime_bounds(csv_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Skipping HOBOlink bounds parse failure for %s: %s", csv_path, exc)
+            continue
+
+        if bounds is None:
+            continue
+
+        scanned_files += 1
+        file_min, file_max = bounds
+        if min_seen is None or file_min < min_seen:
+            min_seen = file_min
+        if max_seen is None or file_max > max_seen:
+            max_seen = file_max
+
+    if min_seen is None or max_seen is None:
+        logger.warning("Unable to derive HOBOlink coverage bounds from usable files.")
+        return None
+
+    logger.info(
+        "HOBOlink coverage bounds derived from %s files: %s to %s",
+        scanned_files,
+        min_seen,
+        max_seen,
+    )
+    return min_seen, max_seen
+
+
 def response_looks_like_csv(response: requests.Response) -> bool:
     """Quickly check if HTTP response appears to be CSV."""
     content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
@@ -523,6 +669,453 @@ def download_to_file_atomic(url: str, destination: Path, timeout_seconds: int = 
     temp_path.replace(destination)
 
 
+def rh_from_dewpoint(temperature_c: float, dew_point_c: float) -> float:
+    """Compute relative humidity (%) from temperature and dew point in Celsius."""
+    return 100 * math.exp(
+        (17.625 * dew_point_c / (243.04 + dew_point_c))
+        - (17.625 * temperature_c / (243.04 + temperature_c))
+    )
+
+
+def ffmc_code(temp_c: float, rh_pct: float, wind_kmh: float, rain_mm: float, ffmc_prev: float) -> float:
+    """Fine Fuel Moisture Code (Van Wagner 1987)."""
+    mo = 147.2 * (101 - ffmc_prev) / (59.5 + ffmc_prev)
+    if rain_mm > 0.5:
+        rf = rain_mm - 0.5
+        if mo > 150:
+            mo = (
+                mo
+                + 42.5 * rf * math.exp(-100 / (251 - mo)) * (1 - math.exp(-6.93 / rf))
+                + 0.0015 * (mo - 150) ** 2 * rf ** 0.5
+            )
+        else:
+            mo = mo + 42.5 * rf * math.exp(-100 / (251 - mo)) * (1 - math.exp(-6.93 / rf))
+        if mo > 250:
+            mo = 250
+
+    ed = (
+        0.942 * rh_pct**0.679
+        + 11 * math.exp((rh_pct - 100) / 10)
+        + 0.18 * (21.1 - temp_c) * (1 - math.exp(-0.115 * rh_pct))
+    )
+    ew = (
+        0.618 * rh_pct**0.753
+        + 10 * math.exp((rh_pct - 100) / 10)
+        + 0.18 * (21.1 - temp_c) * (1 - math.exp(-0.115 * rh_pct))
+    )
+    if mo > ed:
+        ko = 0.424 * (1 - (rh_pct / 100) ** 1.7) + 0.0694 * wind_kmh**0.5 * (1 - (rh_pct / 100) ** 8)
+        kd = ko * 0.581 * math.exp(0.0365 * temp_c)
+        m = ed + (mo - ed) * 10 ** (-kd)
+    elif mo < ew:
+        ko = (
+            0.424 * (1 - ((100 - rh_pct) / 100) ** 1.7)
+            + 0.0694 * wind_kmh**0.5 * (1 - ((100 - rh_pct) / 100) ** 8)
+        )
+        kw = ko * 0.581 * math.exp(0.0365 * temp_c)
+        m = ew - (ew - mo) * 10 ** (-kw)
+    else:
+        m = mo
+
+    return 59.5 * (250 - m) / (147.2 + m)
+
+
+def dmc_code(temp_c: float, rh_pct: float, rain_mm: float, dmc_prev: float, month: int) -> float:
+    """Duff Moisture Code (Van Wagner 1987)."""
+    day_length_factors = [6.5, 7.5, 9.0, 12.8, 13.9, 13.9, 12.4, 10.9, 9.4, 8.0, 7.8, 6.3]
+    if temp_c < -1.1:
+        temp_c = -1.1
+    rk = 1.894 * (temp_c + 1.1) * (100 - rh_pct) * day_length_factors[month - 1] * 1e-4
+
+    if rain_mm > 1.5:
+        # Use canonical DMC effective rain term based on total daily rain.
+        rw = 0.92 * rain_mm - 1.27
+        if rw <= 0:
+            return dmc_prev + rk
+
+        wmi = 20 + 280 / math.exp(0.023 * dmc_prev)
+        if dmc_prev <= 33:
+            b = 100 / (0.5 + 0.3 * dmc_prev)
+        elif dmc_prev <= 65:
+            b = 14 - 1.3 * math.log(dmc_prev)
+        else:
+            b = 6.2 * math.log(dmc_prev) - 17.2
+        wmr = wmi + 1000 * rw / (48.77 + b * rw)
+        if wmr <= 20:
+            pr = 0.0
+        else:
+            pr = 43.43 * (5.6348 - math.log(wmr - 20))
+    else:
+        pr = dmc_prev
+
+    if pr < 0:
+        pr = 0
+    return pr + rk
+
+
+def dc_code(temp_c: float, rain_mm: float, dc_prev: float, month: int) -> float:
+    """Drought Code (Van Wagner 1987)."""
+    seasonal_factors = [-1.6, -1.6, -1.6, 0.9, 3.8, 5.8, 6.4, 5.0, 2.4, 0.4, -1.6, -1.6]
+    if temp_c < -2.8:
+        temp_c = -2.8
+    pe = (0.36 * (temp_c + 2.8) + seasonal_factors[month - 1]) / 2
+    if pe < 0:
+        pe = 0
+
+    if rain_mm > 2.8:
+        # Use canonical DC effective rain term based on total daily rain.
+        rw = 0.83 * rain_mm - 1.27
+        if rw <= 0:
+            return dc_prev + pe
+
+        smi = 800 * math.exp(-dc_prev / 400)
+        log_arg = 1 + 3.937 * rw / smi
+        if log_arg <= 0:
+            dr = 0
+        else:
+            dr = dc_prev - 400 * math.log(log_arg)
+        if dr < 0:
+            dr = 0
+    else:
+        dr = dc_prev
+
+    return dr + pe
+
+
+def isi_index(wind_kmh: float, ffmc_value: float) -> float:
+    """Initial Spread Index from wind and FFMC."""
+    fuel_moisture = 147.2 * (101 - ffmc_value) / (59.5 + ffmc_value)
+    spread_factor = 19.115 * math.exp(-0.1386 * fuel_moisture) * (1 + fuel_moisture**5.31 / 4.93e7)
+    return spread_factor * math.exp(0.05039 * wind_kmh)
+
+
+def bui_index(dmc_value: float, dc_value: float) -> float:
+    """Buildup Index from DMC and DC."""
+    denominator = dmc_value + 0.4 * dc_value
+    if denominator <= 0:
+        return 0.0
+
+    if dmc_value <= 0.4 * dc_value:
+        return 0.8 * dmc_value * dc_value / denominator
+    bui_value = dmc_value - (
+        (1 - 0.8 * dc_value / denominator)
+        * (0.92 + (0.0114 * dmc_value) ** 1.7)
+    )
+    return max(bui_value, 0)
+
+
+def fwi_index(isi_value: float, bui_value: float) -> float:
+    """Fire Weather Index from ISI and BUI."""
+    if bui_value <= 80:
+        bb = 0.1 * isi_value * (0.626 * bui_value**0.809 + 2)
+    else:
+        bb = 0.1 * isi_value * (1000 / (25 + 108.64 * math.exp(-0.023 * bui_value)))
+    if bb <= 1:
+        return bb
+    return math.exp(2.72 * (0.434 * math.log(bb)) ** 0.647)
+
+
+def fetch_hourly_range(climate_id: int | str, start_dt: str, end_dt: str, logger) -> List[Dict[str, object]]:
+    """Fetch all hourly station records for a datetime range from MSC GeoMet API."""
+    records: List[Dict[str, object]] = []
+    offset = 0
+    expected_total: Optional[int] = None
+
+    while True:
+        params = {
+            "CLIMATE_IDENTIFIER": str(climate_id),
+            "datetime": f"{start_dt}/{end_dt}",
+            "f": "json",
+            "limit": FWI_PAGE_LIMIT,
+            "offset": offset,
+            "sortby": "LOCAL_DATE",
+        }
+        payload: Dict[str, object] = {}
+        for attempt in range(1, FWI_REQUEST_MAX_RETRIES + 1):
+            try:
+                response = requests.get(
+                    FWI_API_BASE,
+                    params=params,
+                    timeout=FWI_REQUEST_TIMEOUT_SECONDS,
+                    headers={"User-Agent": "fwi-research/1.0"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                break
+            except requests.RequestException as exc:
+                if attempt >= FWI_REQUEST_MAX_RETRIES:
+                    raise RuntimeError(
+                        f"Stanhope FWI API request failed at offset {offset} after "
+                        f"{FWI_REQUEST_MAX_RETRIES} attempts: {exc}"
+                    ) from exc
+
+                sleep_seconds = FWI_REQUEST_RETRY_BACKOFF_SECONDS * attempt
+                logger.warning(
+                    "Stanhope FWI API request retry %s/%s at offset %s after error: %s",
+                    attempt,
+                    FWI_REQUEST_MAX_RETRIES,
+                    offset,
+                    exc,
+                )
+                time.sleep(sleep_seconds)
+
+        features = payload.get("features", [])
+        if not isinstance(features, list):
+            raise RuntimeError(
+                f"Stanhope FWI API returned unexpected payload type for features at offset {offset}."
+            )
+
+        if expected_total is None:
+            number_matched = payload.get("numberMatched")
+            if number_matched is not None:
+                expected_total = int(number_matched)
+
+        records.extend(features)
+        total = expected_total if expected_total is not None else len(records)
+        logger.info("Stanhope FWI fetch progress: %s/%s records", len(records), total)
+
+        if len(records) >= total or not features:
+            break
+
+        offset += FWI_PAGE_LIMIT
+        if FWI_REQUEST_DELAY_SECONDS > 0:
+            time.sleep(FWI_REQUEST_DELAY_SECONDS)
+
+    if expected_total is not None and len(records) < expected_total:
+        raise RuntimeError(
+            "Stanhope FWI API paging completed with incomplete record count: "
+            f"expected {expected_total}, got {len(records)}."
+        )
+
+    return records
+
+
+def parse_local_datetime(local_date_text: str) -> Optional[datetime]:
+    """Parse LOCAL_DATE string from GeoMet payload into datetime."""
+    text = str(local_date_text).strip()
+    if not text:
+        return None
+    for token in (" ", "T"):
+        candidate = text.replace(" ", token)
+        try:
+            return datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+    return None
+
+
+def extract_daily_fwi_inputs(records: List[Dict[str, object]]) -> Dict[str, Dict[str, float]]:
+    """Build per-day noon weather inputs plus trailing 24h precipitation."""
+    by_dt: Dict[datetime, Dict[str, object]] = {}
+    for feature in records:
+        properties = feature.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        dt = parse_local_datetime(properties.get("LOCAL_DATE", ""))
+        if dt is None:
+            continue
+        by_dt[dt] = properties
+
+    if not by_dt:
+        return {}
+
+    dates = sorted({stamp.date() for stamp in by_dt})
+    daily: Dict[str, Dict[str, float]] = {}
+
+    for day in dates:
+        noon_properties: Optional[Dict[str, object]] = None
+        for hour in (12, 11, 13):
+            candidate = datetime(day.year, day.month, day.day, hour)
+            if candidate in by_dt:
+                noon_properties = by_dt[candidate]
+                break
+        if noon_properties is None:
+            continue
+
+        temp = noon_properties.get("TEMP")
+        wind = noon_properties.get("WIND_SPEED")
+        rh = noon_properties.get("RELATIVE_HUMIDITY")
+        dew_point = noon_properties.get("DEW_POINT_TEMP")
+
+        if temp is None or wind is None:
+            continue
+        if rh is None and dew_point is not None:
+            rh = rh_from_dewpoint(float(temp), float(dew_point))
+        if rh is None:
+            continue
+
+        temp_value = float(temp)
+        rh_value = max(1.0, min(100.0, float(rh)))
+        wind_value = float(wind)
+
+        precip_total = 0.0
+        noon_stamp = datetime(day.year, day.month, day.day, 12)
+        for offset_hours in range(1, 25):
+            stamp = noon_stamp - timedelta(hours=24 - offset_hours)
+            hourly = by_dt.get(stamp)
+            if not hourly:
+                continue
+            precip = hourly.get("PRECIP_AMOUNT")
+            if precip is None:
+                continue
+            precip_total += float(precip)
+
+        daily[str(day)] = {
+            "t": temp_value,
+            "h": rh_value,
+            "w": wind_value,
+            "p": precip_total,
+        }
+
+    return daily
+
+
+def compute_fwi_daily_records(daily_inputs: Dict[str, Dict[str, float]]) -> List[Dict[str, object]]:
+    """Compute daily FWI metrics sequentially from daily noon weather inputs."""
+    ffmc_value = FFMC_START
+    dmc_value = DMC_START
+    dc_value = DC_START
+    results: List[Dict[str, object]] = []
+
+    for date_text in sorted(daily_inputs.keys()):
+        values = daily_inputs[date_text]
+        month = int(date_text[5:7])
+
+        ffmc_value = ffmc_code(values["t"], values["h"], values["w"], values["p"], ffmc_value)
+        dmc_value = dmc_code(values["t"], values["h"], values["p"], dmc_value, month)
+        dc_value = dc_code(values["t"], values["p"], dc_value, month)
+
+        isi_value = isi_index(values["w"], ffmc_value)
+        bui_value = bui_index(dmc_value, dc_value)
+        fwi_value = fwi_index(isi_value, bui_value)
+
+        results.append(
+            {
+                "Date": date_text,
+                "T_noon": round(values["t"], 1),
+                "RH_noon": round(values["h"], 0),
+                "Wind_noon": round(values["w"], 0),
+                "Precip_24h": round(values["p"], 1),
+                "FFMC": round(ffmc_value, 2),
+                "DMC": round(dmc_value, 2),
+                "DC": round(dc_value, 2),
+                "ISI": round(isi_value, 2),
+                "BUI": round(bui_value, 2),
+                "FWI": round(fwi_value, 2),
+            }
+        )
+
+    return results
+
+
+def compute_stanhope_fwi_daily_file(
+    *,
+    station_name: str,
+    climate_id: int | str,
+    year: int,
+    start_date: date,
+    end_date: date,
+    destination: Path,
+    logger,
+) -> Tuple[str, int, str, Optional[str], Optional[str], Optional[List[str]]]:
+    """Compute and write one annual daily FWI CSV for Stanhope from hourly API data."""
+    start_dt = f"{start_date:%Y-%m-%d}T00:00:00"
+    end_dt = f"{end_date:%Y-%m-%d}T23:59:59"
+
+    logger.info(
+        "Computing Stanhope daily FWI for %s (%s to %s).",
+        year,
+        start_dt[:10],
+        end_dt[:10],
+    )
+
+    try:
+        records = fetch_hourly_range(
+            climate_id=climate_id,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            logger=logger,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return (
+            STATUS_FAILED_DOWNLOAD,
+            0,
+            "",
+            f"FWI hourly API fetch failed: {exc}",
+            None,
+            None,
+        )
+
+    if not records:
+        return (
+            STATUS_FAILED_DOWNLOAD,
+            0,
+            "",
+            "No hourly API records returned for requested period.",
+            None,
+            None,
+        )
+
+    daily_inputs = extract_daily_fwi_inputs(records)
+    if not daily_inputs:
+        return (
+            STATUS_FAILED_READ,
+            0,
+            "",
+            "No complete daily noon inputs found to compute FWI.",
+            None,
+            None,
+        )
+
+    results = compute_fwi_daily_records(daily_inputs)
+    if not results:
+        return (
+            STATUS_FAILED_READ,
+            0,
+            "",
+            "FWI computation produced no records.",
+            None,
+            None,
+        )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(results[0].keys()))
+        writer.writeheader()
+        writer.writerows(results)
+
+    size_bytes = destination.stat().st_size
+    sha256_value = compute_sha256(destination)
+    schema_status, error_message, schema_hash, columns = inspect_csv_schema(destination, "eccc_fwi_daily")
+    if schema_status == STATUS_FAILED_READ:
+        return STATUS_FAILED_READ, size_bytes, sha256_value, error_message, schema_hash, columns
+
+    logger.info(
+        "Stanhope daily FWI computed for %s: %s days saved to %s",
+        year,
+        len(results),
+        destination,
+    )
+    return STATUS_DOWNLOADED, size_bytes, sha256_value, None, schema_hash, columns
+
+
+def get_first_fwi_date(csv_path: Path) -> Optional[date]:
+    """Return first Date value from a computed daily FWI CSV, if available."""
+    try:
+        frame = pd.read_csv(csv_path, usecols=["Date"], nrows=1)
+    except Exception:  # noqa: BLE001
+        return None
+
+    if frame.empty:
+        return None
+
+    value = frame.iloc[0].get("Date")
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def get_eccc_download_mode(climate_id: int, probe_year: int, logger) -> str:
     """Prefer annual downloads when supported by endpoint, else use monthly."""
     annual_url = (
@@ -552,87 +1145,63 @@ def build_eccc_url(climate_id: int, year: int, month: Optional[int]) -> str:
     return f"{base}&Month={month}&Day=1"
 
 
-def build_eccc_fwi_daily_url(station_id: int | str, year: int) -> str:
-    """Build ECCC daily bulk URL for annual FWI cache attempts."""
-    return (
-        f"{ECCC_FWI_DAILY_BASE_URL}?format=csv&climate_id={station_id}"
-        f"&Year={year}&timeframe=2"
-    )
-
-
-def build_cwfis_fwi_daily_url(station_id: int | str, year: int) -> Optional[str]:
-    """Build optional fallback CWFIS/NFP URL from configured template."""
-    if not CWFIS_FWI_DAILY_URL_TEMPLATE.strip():
-        return None
-    return CWFIS_FWI_DAILY_URL_TEMPLATE.format(station_id=station_id, year=year)
-
-
 def download_eccc_fwi_daily_periods(
     *,
     station_name: str,
     station_id: int | str,
     start_year: int,
     end_year: int,
+    end_date: date,
     latest_index: Dict[str, Dict[str, object]],
     logger,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-    """Download or validate annual daily FWI files with optional fallback endpoint."""
+    """Compute annual daily Stanhope FWI files from observed hourly ECCC inputs."""
     manifest_rows: List[Dict[str, object]] = []
     schema_rows: List[Dict[str, object]] = []
-
-    def _attempt_download(year: int, destination: Path) -> Tuple[str, int, str, Optional[str], Optional[str], Optional[List[str]]]:
-        schema_failure_seen = False
-        last_error: Optional[str] = None
-
-        sources: List[Tuple[str, Optional[str]]] = [
-            ("eccc", build_eccc_fwi_daily_url(station_id=station_id, year=year)),
-            ("cwfis", build_cwfis_fwi_daily_url(station_id=station_id, year=year)),
-        ]
-
-        for source_name, url in sources:
-            if not url:
-                continue
-
-            try:
-                download_to_file_atomic(url=url, destination=destination)
-            except Exception as exc:  # noqa: BLE001
-                last_error = f"{source_name} download failed: {exc}"
-                logger.warning("FWI %s download failed for %s: %s", source_name, year, exc)
-                continue
-
-            size_bytes = destination.stat().st_size
-            sha256_value = compute_sha256(destination)
-            schema_status, error_message, schema_hash, columns = inspect_csv_schema(
-                destination,
-                "eccc_fwi_daily",
-            )
-
-            if schema_status == STATUS_FAILED_READ:
-                schema_failure_seen = True
-                last_error = f"{source_name} schema invalid: {error_message}"
-                logger.warning(
-                    "FWI %s schema invalid for %s: %s",
-                    source_name,
-                    year,
-                    error_message,
-                )
-                if source_name == "eccc":
-                    logger.info("Trying fallback FWI source for %s after ECCC schema mismatch.", year)
-                continue
-
-            provenance = None if source_name == "eccc" else f"downloaded via {source_name} fallback"
-            return STATUS_DOWNLOADED, size_bytes, sha256_value, provenance, schema_hash, columns
-
-        if schema_failure_seen:
-            return STATUS_FAILED_READ, 0, "", last_error, None, None
-        return STATUS_FAILED_DOWNLOAD, 0, "", last_error, None, None
 
     for year in range(start_year, end_year + 1):
         period = str(year)
         file_name = f"ECCC_{station_slug(station_name)}_{period}_daily_fwi.csv"
         destination = ECCC_FWI_CACHE_DIR / file_name
 
+        year_start = date(year, FWI_SEASON_START_MONTH, FWI_SEASON_START_DAY)
+        year_end = date(year, 12, 31)
+        if year == end_year:
+            year_end = end_date
+
+        if year_end < year_start:
+            error_message = (
+                "FWI compute window invalid: end date precedes configured seasonal start "
+                f"({year_start.isoformat()})."
+            )
+            manifest_rows.append(
+                create_manifest_row(
+                    source="eccc_fwi_daily",
+                    station_raw=station_name,
+                    year=year,
+                    period=period,
+                    file_path=destination,
+                    size_bytes=0,
+                    sha256_value="",
+                    status=STATUS_FAILED_READ,
+                    error_message=error_message,
+                    schema_hash=None,
+                )
+            )
+            continue
+
+        recompute_existing = False
         if destination.exists():
+            first_date = get_first_fwi_date(destination)
+            if first_date is None or first_date.month < FWI_SEASON_START_MONTH:
+                recompute_existing = True
+                logger.info(
+                    "Recomputing %s because cached daily FWI starts before seasonal window (%s).",
+                    destination.name,
+                    first_date,
+                )
+
+        if destination.exists() and not recompute_existing:
             size_bytes = destination.stat().st_size
             unchanged, cached_hash = classify_unchanged(destination, latest_index)
             if unchanged and cached_hash:
@@ -647,17 +1216,17 @@ def download_eccc_fwi_daily_periods(
                 "eccc_fwi_daily",
             )
             final_status = base_status if schema_status != STATUS_FAILED_READ else STATUS_FAILED_READ
-
-            if final_status == STATUS_FAILED_READ:
-                logger.info("Attempting FWI re-download for %s due to schema failure.", period)
-                final_status, size_bytes, sha256_value, error_message, schema_hash, columns = _attempt_download(
-                    year,
-                    destination,
-                )
         else:
-            final_status, size_bytes, sha256_value, error_message, schema_hash, columns = _attempt_download(
-                year,
-                destination,
+            final_status, size_bytes, sha256_value, error_message, schema_hash, columns = (
+                compute_stanhope_fwi_daily_file(
+                    station_name=station_name,
+                    climate_id=station_id,
+                    year=year,
+                    start_date=year_start,
+                    end_date=year_end,
+                    destination=destination,
+                    logger=logger,
+                )
             )
 
         if schema_hash and columns:
@@ -797,6 +1366,59 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def acquire_obtain_lock(lock_path: Path, logger) -> bool:
+    """Acquire a single-run lock so obtain is not executed concurrently."""
+    payload = {
+        "pid": os.getpid(),
+        "started_at_utc": utc_now_iso(),
+    }
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=True)
+        return True
+    except FileExistsError:
+        # Auto-recover stale lock from crashed or externally-killed process.
+        try:
+            stale = json.loads(lock_path.read_text(encoding="utf-8"))
+            stale_pid = int(stale.get("pid"))
+            if stale_pid > 0:
+                try:
+                    os.kill(stale_pid, 0)
+                except OSError:
+                    lock_path.unlink(missing_ok=True)
+                    logger.warning("Removed stale obtain lock from non-running pid %s.", stale_pid)
+                    return acquire_obtain_lock(lock_path, logger)
+        except Exception:  # noqa: BLE001
+            pass
+
+        details = ""
+        try:
+            stale = json.loads(lock_path.read_text(encoding="utf-8"))
+            details = f" Existing lock metadata: {stale}"
+        except Exception:  # noqa: BLE001
+            details = ""
+
+        logger.error(
+            "Another obtain run appears active because lock file exists at %s.%s",
+            lock_path,
+            details,
+        )
+        logger.error("If no run is active, remove the stale lock file and rerun obtain.")
+        return False
+
+
+def release_obtain_lock(lock_path: Path, logger) -> None:
+    """Release obtain run lock best-effort."""
+    try:
+        if lock_path.exists():
+            lock_path.unlink()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to remove obtain lock file %s: %s", lock_path, exc)
+
+
 def main() -> int:
     """Run local HOBOlink discovery and incremental ECCC downloads."""
     args = parse_args()
@@ -804,73 +1426,99 @@ def main() -> int:
     log_path = LOGS_DIR / f"obtain_{datetime.now(timezone.utc):%Y%m%d}.log"
     logger = setup_logging("01_obtain", log_file_path=log_path)
 
-    logger.info("Step 2 Obtain started.")
-    logger.info("ECCC Stanhope climate identifier: %s", ECCC_STANHOPE_CLIMATE_ID)
-
-    hobolink_history = load_manifest(HOBOLINK_MANIFEST)
-    eccc_history = load_manifest(ECCC_MANIFEST)
-    eccc_fwi_history = load_manifest(ECCC_FWI_MANIFEST)
-    hobolink_index = latest_manifest_index(hobolink_history)
-    eccc_index = latest_manifest_index(eccc_history)
-    eccc_fwi_index = latest_manifest_index(eccc_fwi_history)
-
-    hobolink_dropzones = get_hobolink_dropzones()
-    hobolink_rows, hobolink_schema_rows, hobolink_years = discover_hobolink(
-        dropzones=hobolink_dropzones,
-        latest_index=hobolink_index,
-        logger=logger,
-    )
-
-
-    # Set default start year to 2021, end year to current UTC year if not provided
-    default_start_year = 2021
-    default_end_year = datetime.now(timezone.utc).year
-    start_year = args.start_year if args.start_year is not None else default_start_year
-    end_year = args.end_year if args.end_year is not None else default_end_year
-    if start_year > end_year:
-        logger.error("Invalid year range: start_year (%s) > end_year (%s).", start_year, end_year)
+    if not acquire_obtain_lock(OBTAIN_LOCK_PATH, logger):
         return 1
 
-    logger.info("ECCC period coverage: %s to %s", start_year, end_year)
+    try:
+        logger.info("Step 2 Obtain started.")
+        logger.info("ECCC Stanhope climate identifier: %s", ECCC_STANHOPE_CLIMATE_ID)
+        logger.info("Stanhope daily FWI source: computed locally from ECCC hourly API observations.")
 
-    eccc_rows, eccc_schema_rows = download_eccc_periods(
-        station_name=ECCC_STANHOPE_NAME,
-        climate_id=ECCC_STANHOPE_CLIMATE_ID,
-        start_year=start_year,
-        end_year=end_year,
-        latest_index=eccc_index,
-        logger=logger,
-    )
+        hobolink_history = load_manifest(HOBOLINK_MANIFEST)
+        eccc_history = load_manifest(ECCC_MANIFEST)
+        eccc_fwi_history = load_manifest(ECCC_FWI_MANIFEST)
+        hobolink_index = latest_manifest_index(hobolink_history)
+        eccc_index = latest_manifest_index(eccc_history)
+        eccc_fwi_index = latest_manifest_index(eccc_fwi_history)
 
-    eccc_fwi_rows, eccc_fwi_schema_rows = download_eccc_fwi_daily_periods(
-        station_name=ECCC_STANHOPE_NAME,
-        station_id=ECCC_STANHOPE_FWI_ID,
-        start_year=start_year,
-        end_year=end_year,
-        latest_index=eccc_fwi_index,
-        logger=logger,
-    )
+        hobolink_dropzones = get_hobolink_dropzones()
+        hobolink_rows, hobolink_schema_rows, _ = discover_hobolink(
+            dropzones=hobolink_dropzones,
+            latest_index=hobolink_index,
+            logger=logger,
+        )
 
-    append_manifest_rows(HOBOLINK_MANIFEST, hobolink_rows)
-    append_manifest_rows(ECCC_MANIFEST, eccc_rows)
-    append_manifest_rows(ECCC_FWI_MANIFEST, eccc_fwi_rows)
-    update_schema_inventory(hobolink_schema_rows + eccc_schema_rows + eccc_fwi_schema_rows)
+        coverage_bounds = derive_hobolink_coverage_bounds(hobolink_rows, logger)
+        if coverage_bounds is None:
+            logger.error("Cannot compute Stanhope FWI window because HOBOlink coverage bounds were not found.")
+            return 1
+        hobolink_start, hobolink_end = coverage_bounds
 
-    hobolink_status = pd.Series([row["status"] for row in hobolink_rows]).value_counts().to_dict()
-    eccc_status = pd.Series([row["status"] for row in eccc_rows]).value_counts().to_dict()
-    eccc_fwi_status = pd.Series([row["status"] for row in eccc_fwi_rows]).value_counts().to_dict()
 
-    logger.info("Summary: HOBOlink files processed = %s", len(hobolink_rows))
-    logger.info("Summary: HOBOlink statuses = %s", hobolink_status)
-    logger.info("Summary: ECCC periods processed = %s", len(eccc_rows))
-    logger.info("Summary: ECCC statuses = %s", eccc_status)
-    logger.info("Summary: ECCC FWI daily periods processed = %s", len(eccc_fwi_rows))
-    logger.info("Summary: ECCC FWI daily statuses = %s", eccc_fwi_status)
-    logger.info(
-        "Next steps: run 02_scrub.py for UTC normalization, missing-value handling, and hourly resampling."
-    )
-    logger.info("Step 2 Obtain completed. Logs written to %s", log_path)
-    return 0
+        # Set default start year to 2021, end year to current UTC year if not provided
+        default_start_year = 2021
+        default_end_year = datetime.now(timezone.utc).year
+        start_year = args.start_year if args.start_year is not None else default_start_year
+        end_year = args.end_year if args.end_year is not None else default_end_year
+        if start_year > end_year:
+            logger.error("Invalid year range: start_year (%s) > end_year (%s).", start_year, end_year)
+            return 1
+
+        fwi_start_year = hobolink_start.year
+        fwi_end_year = hobolink_end.year
+        fwi_end_date = hobolink_end
+        logger.info(
+            "Stanhope FWI compute window forced to HOBOlink coverage: %s-01-01 to %s",
+            fwi_start_year,
+            fwi_end_date,
+        )
+
+        logger.info("ECCC period coverage: %s to %s", start_year, end_year)
+
+        eccc_rows, eccc_schema_rows = download_eccc_periods(
+            station_name=ECCC_STANHOPE_NAME,
+            climate_id=ECCC_STANHOPE_CLIMATE_ID,
+            start_year=start_year,
+            end_year=end_year,
+            latest_index=eccc_index,
+            logger=logger,
+        )
+
+        eccc_fwi_rows, eccc_fwi_schema_rows = download_eccc_fwi_daily_periods(
+            station_name=ECCC_STANHOPE_NAME,
+            station_id=ECCC_STANHOPE_CLIMATE_ID,
+            start_year=fwi_start_year,
+            end_year=fwi_end_year,
+            end_date=fwi_end_date,
+            latest_index=eccc_fwi_index,
+            logger=logger,
+        )
+
+        append_manifest_rows(HOBOLINK_MANIFEST, hobolink_rows)
+        append_manifest_rows(ECCC_MANIFEST, eccc_rows)
+        append_manifest_rows(ECCC_FWI_MANIFEST, eccc_fwi_rows)
+        update_schema_inventory(hobolink_schema_rows + eccc_schema_rows + eccc_fwi_schema_rows)
+
+        hobolink_status = pd.Series([row["status"] for row in hobolink_rows]).value_counts().to_dict()
+        eccc_status = pd.Series([row["status"] for row in eccc_rows]).value_counts().to_dict()
+        eccc_fwi_status = pd.Series([row["status"] for row in eccc_fwi_rows]).value_counts().to_dict()
+
+        logger.info("Summary: HOBOlink files processed = %s", len(hobolink_rows))
+        logger.info("Summary: HOBOlink statuses = %s", hobolink_status)
+        logger.info("Summary: ECCC periods processed = %s", len(eccc_rows))
+        logger.info("Summary: ECCC statuses = %s", eccc_status)
+        logger.info("Summary: ECCC FWI daily periods processed = %s", len(eccc_fwi_rows))
+        logger.info("Summary: ECCC FWI daily statuses = %s", eccc_fwi_status)
+        logger.info(
+            "Next steps: run 02_scrub.py for UTC normalization, missing-value handling, and hourly resampling."
+        )
+        logger.info("Step 2 Obtain completed. Logs written to %s", log_path)
+        return 0
+    except KeyboardInterrupt:
+        logger.error("Obtain interrupted before completion. Exiting cleanly.")
+        return 130
+    finally:
+        release_obtain_lock(OBTAIN_LOCK_PATH, logger)
 
 
 if __name__ == "__main__":
