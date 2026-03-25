@@ -25,9 +25,7 @@ from config import (
     setup_logging,
 )
 
-matplotlib.use("Agg")
-
-INPUT_HOURLY = SCRUBBED_DIR / "hourly_weather_utc.csv"
+INPUT_HOURLY = SCRUBBED_DIR / "02_hourly_weather_utc.csv"
 
 CORE_VARS = [
     CANONICAL_VARIABLES["temp"],
@@ -648,7 +646,7 @@ def _plot_monthly_precip_corr_heatmaps(df: pd.DataFrame, output_dir: Path) -> Li
         month_df = df[df["datetime_utc"].dt.month == month].copy()
         matrix = _corr_matrix(month_df, CANONICAL_VARIABLES["rain"])
         month_slug = MONTH_LABELS[month]
-        out_path = output_dir / f"explore_corr_precip_{month:02d}_{month_slug}.png"
+        out_path = output_dir / f"03_explore_corr_precip_{month:02d}_{month_slug}.png"
         _plot_corr_heatmap(
             matrix,
             f"Correlation Matrix: Precipitation ({month_slug.upper()} pooled across years)",
@@ -687,57 +685,57 @@ def main() -> int:
         df, min_overlap_hours=MIN_PAIRWISE_OVERLAP_HOURS
     )
 
-    write_csv(coverage_overall, TABLES_DIR / "explore_coverage_overall.csv")
-    write_csv(coverage_monthly, TABLES_DIR / "explore_coverage_monthly.csv")
-    write_csv(noon_readiness, TABLES_DIR / "explore_noon_readiness.csv")
-    write_csv(pairwise_core, TABLES_DIR / "explore_pairwise_core_metrics.csv")
-    write_csv(pairwise_precip, TABLES_DIR / "explore_pairwise_precip_metrics.csv")
-    write_csv(pairwise_wind_uv, TABLES_DIR / "explore_pairwise_wind_uv_metrics.csv")
-    write_csv(pairwise_seasonal, TABLES_DIR / "explore_pairwise_seasonal_metrics.csv")
+    write_csv(coverage_overall, TABLES_DIR / "03_explore_coverage_overall.csv")
+    write_csv(coverage_monthly, TABLES_DIR / "03_explore_coverage_monthly.csv")
+    write_csv(noon_readiness, TABLES_DIR / "03_explore_noon_readiness.csv")
+    write_csv(pairwise_core, TABLES_DIR / "03_explore_pairwise_core_metrics.csv")
+    write_csv(pairwise_precip, TABLES_DIR / "03_explore_pairwise_precip_metrics.csv")
+    write_csv(pairwise_wind_uv, TABLES_DIR / "03_explore_pairwise_wind_uv_metrics.csv")
+    write_csv(pairwise_seasonal, TABLES_DIR / "03_explore_pairwise_seasonal_metrics.csv")
 
-    _plot_missingness_heatmap(coverage_overall, FIGURES_DIR / "explore_missingness_heatmap.png")
-    _plot_missingness_timeline(coverage_monthly, FIGURES_DIR / "explore_missingness_timeline.png")
-    _plot_distributions(df, FIGURES_DIR / "explore_distributions.png")
-    selected_year, selected_month = _plot_summer_timeseries(df, FIGURES_DIR / "explore_timeseries_summer.png")
-    _plot_wind_roses(df, FIGURES_DIR / "explore_wind_roses.png")
-    _plot_noon_readiness(noon_readiness, FIGURES_DIR / "explore_noon_readiness.png")
+    _plot_missingness_heatmap(coverage_overall, FIGURES_DIR / "03_explore_missingness_heatmap.png")
+    _plot_missingness_timeline(coverage_monthly, FIGURES_DIR / "03_explore_missingness_timeline.png")
+    _plot_distributions(df, FIGURES_DIR / "03_explore_distributions.png")
+    selected_year, selected_month = _plot_summer_timeseries(df, FIGURES_DIR / "03_explore_timeseries_summer.png")
+    _plot_wind_roses(df, FIGURES_DIR / "03_explore_wind_roses.png")
+    _plot_noon_readiness(noon_readiness, FIGURES_DIR / "03_explore_noon_readiness.png")
 
     corr_temp = _corr_matrix(df, CANONICAL_VARIABLES["temp"])
     corr_rh = _corr_matrix(df, CANONICAL_VARIABLES["rh"])
     corr_wind = _corr_matrix(df, CANONICAL_VARIABLES["wind_speed"])
     corr_precip = _corr_matrix(df, CANONICAL_VARIABLES["rain"])
-    _plot_corr_heatmap(corr_temp, "Correlation Matrix: Air Temperature", FIGURES_DIR / "explore_corr_temp.png")
-    _plot_corr_heatmap(corr_rh, "Correlation Matrix: Relative Humidity", FIGURES_DIR / "explore_corr_rh.png")
+    _plot_corr_heatmap(corr_temp, "Correlation Matrix: Air Temperature", FIGURES_DIR / "03_explore_corr_temp.png")
+    _plot_corr_heatmap(corr_rh, "Correlation Matrix: Relative Humidity", FIGURES_DIR / "03_explore_corr_rh.png")
     _plot_corr_heatmap(
         corr_wind,
         "Correlation Matrix: Wind Speed",
-        FIGURES_DIR / "explore_corr_wind_speed.png",
+        FIGURES_DIR / "03_explore_corr_wind_speed.png",
     )
     _plot_corr_heatmap(
         corr_precip,
         "Correlation Matrix: Precipitation",
-        FIGURES_DIR / "explore_corr_precip.png",
+        FIGURES_DIR / "03_explore_corr_precip.png",
     )
     monthly_precip_corr_files = _plot_monthly_precip_corr_heatmaps(df, FIGURES_DIR)
 
-    logger.info("Wrote table: %s", TABLES_DIR / "explore_coverage_overall.csv")
-    logger.info("Wrote table: %s", TABLES_DIR / "explore_coverage_monthly.csv")
-    logger.info("Wrote table: %s", TABLES_DIR / "explore_noon_readiness.csv")
-    logger.info("Wrote table: %s", TABLES_DIR / "explore_pairwise_core_metrics.csv")
-    logger.info("Wrote table: %s", TABLES_DIR / "explore_pairwise_precip_metrics.csv")
-    logger.info("Wrote table: %s", TABLES_DIR / "explore_pairwise_wind_uv_metrics.csv")
-    logger.info("Wrote table: %s", TABLES_DIR / "explore_pairwise_seasonal_metrics.csv")
+    logger.info("Wrote table: %s", TABLES_DIR / "03_explore_coverage_overall.csv")
+    logger.info("Wrote table: %s", TABLES_DIR / "03_explore_coverage_monthly.csv")
+    logger.info("Wrote table: %s", TABLES_DIR / "03_explore_noon_readiness.csv")
+    logger.info("Wrote table: %s", TABLES_DIR / "03_explore_pairwise_core_metrics.csv")
+    logger.info("Wrote table: %s", TABLES_DIR / "03_explore_pairwise_precip_metrics.csv")
+    logger.info("Wrote table: %s", TABLES_DIR / "03_explore_pairwise_wind_uv_metrics.csv")
+    logger.info("Wrote table: %s", TABLES_DIR / "03_explore_pairwise_seasonal_metrics.csv")
 
-    logger.info("Wrote figure: %s", FIGURES_DIR / "explore_missingness_heatmap.png")
-    logger.info("Wrote figure: %s", FIGURES_DIR / "explore_missingness_timeline.png")
-    logger.info("Wrote figure: %s", FIGURES_DIR / "explore_distributions.png")
-    logger.info("Wrote figure: %s", FIGURES_DIR / "explore_timeseries_summer.png")
-    logger.info("Wrote figure: %s", FIGURES_DIR / "explore_wind_roses.png")
-    logger.info("Wrote figure: %s", FIGURES_DIR / "explore_noon_readiness.png")
-    logger.info("Wrote figure: %s", FIGURES_DIR / "explore_corr_temp.png")
-    logger.info("Wrote figure: %s", FIGURES_DIR / "explore_corr_rh.png")
-    logger.info("Wrote figure: %s", FIGURES_DIR / "explore_corr_wind_speed.png")
-    logger.info("Wrote figure: %s", FIGURES_DIR / "explore_corr_precip.png")
+    logger.info("Wrote figure: %s", FIGURES_DIR / "03_explore_missingness_heatmap.png")
+    logger.info("Wrote figure: %s", FIGURES_DIR / "03_explore_missingness_timeline.png")
+    logger.info("Wrote figure: %s", FIGURES_DIR / "03_explore_distributions.png")
+    logger.info("Wrote figure: %s", FIGURES_DIR / "03_explore_timeseries_summer.png")
+    logger.info("Wrote figure: %s", FIGURES_DIR / "03_explore_wind_roses.png")
+    logger.info("Wrote figure: %s", FIGURES_DIR / "03_explore_noon_readiness.png")
+    logger.info("Wrote figure: %s", FIGURES_DIR / "03_explore_corr_temp.png")
+    logger.info("Wrote figure: %s", FIGURES_DIR / "03_explore_corr_rh.png")
+    logger.info("Wrote figure: %s", FIGURES_DIR / "03_explore_corr_wind_speed.png")
+    logger.info("Wrote figure: %s", FIGURES_DIR / "03_explore_corr_precip.png")
     for file_path in monthly_precip_corr_files:
         logger.info("Wrote figure: %s", file_path)
 

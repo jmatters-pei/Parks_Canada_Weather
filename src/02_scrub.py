@@ -22,14 +22,14 @@ from config import (
     setup_logging,
 )
 
-HOBOLINK_MANIFEST = MANIFEST_DIR / "obtain_hobolink_files.csv"
-ECCC_MANIFEST = MANIFEST_DIR / "obtain_eccc_periods.csv"
-SCRUB_RUNS_MANIFEST = MANIFEST_DIR / "scrub_runs.csv"
+HOBOLINK_MANIFEST = MANIFEST_DIR / "01_obtain_hobolink_files.csv"
+ECCC_MANIFEST = MANIFEST_DIR / "01_obtain_eccc_periods.csv"
+SCRUB_RUNS_MANIFEST = MANIFEST_DIR / "02_scrub_runs.csv"
 
-OUTPUT_HOURLY = SCRUBBED_DIR / "hourly_weather_utc.csv"
-OUTPUT_MISSINGNESS = SCRUBBED_DIR / "missingness_hourly_summary.csv"
-OUTPUT_QC_COUNTS = SCRUBBED_DIR / "qc_out_of_range_counts.csv"
-OUTPUT_PRECIP_LOG = SCRUBBED_DIR / "precip_semantics_log.csv"
+OUTPUT_HOURLY = SCRUBBED_DIR / "02_hourly_weather_utc.csv"
+OUTPUT_MISSINGNESS = SCRUBBED_DIR / "02_missingness_hourly_summary.csv"
+OUTPUT_QC_COUNTS = SCRUBBED_DIR / "02_qc_out_of_range_counts.csv"
+OUTPUT_PRECIP_LOG = SCRUBBED_DIR / "02_precip_semantics_log.csv"
 
 READ_ENCODINGS = ("utf-8-sig", "cp1252", "latin-1")
 NA_STRINGS = ["", "NA", "N/A", "na", "null", "NULL"]
@@ -257,11 +257,19 @@ def parse_hobolink_file(path: Path, row: pd.Series, logger) -> Tuple[pd.DataFram
     raw.columns = normalize_header_columns(raw.columns)
 
     if "Date" in raw.columns and "Time" in raw.columns:
+        # Fast-path: HOBOlink exports commonly look like:
+        #   Date="11/01/2022", Time="00:00:00 -0300"
+        # Using an explicit format is dramatically faster than dateutil inference.
+        dt_text = raw["Date"].astype(str).str.strip() + " " + raw["Time"].astype(str).str.strip()
         timestamp = pd.to_datetime(
-            raw["Date"].astype(str).str.strip() + " " + raw["Time"].astype(str).str.strip(),
+            dt_text,
+            format="%m/%d/%Y %H:%M:%S %z",
             errors="coerce",
             utc=True,
         )
+        # Fallback for any non-standard rows/files.
+        if float(timestamp.isna().mean()) > 0.05:
+            timestamp = pd.to_datetime(dt_text, errors="coerce", utc=True, cache=True)
     else:
         datetime_cols = [c for c in raw.columns if "date/time" in c.lower() or "datetime" in c.lower()]
         if not datetime_cols:

@@ -21,10 +21,10 @@ from config import (
     setup_logging,
 )
 
-INPUT_HOURLY = SCRUBBED_DIR / "hourly_weather_utc.csv"
+INPUT_HOURLY = SCRUBBED_DIR / "02_hourly_weather_utc.csv"
 REFERENCE_FWI_DIR = ECCC_FWI_CACHE_DIR
-OUTPUT_MODEL_DAILY = TABLES_DIR / "model_fwi_daily.csv"
-OUTPUT_VALIDATION = TABLES_DIR / "model_fwi_validation_summary.csv"
+OUTPUT_MODEL_DAILY = TABLES_DIR / "04_model_fwi_daily.csv"
+OUTPUT_VALIDATION = TABLES_DIR / "04_model_fwi_validation_summary.csv"
 
 HALIFAX_TZ = ZoneInfo("America/Halifax")
 UTC_TZ = ZoneInfo("UTC")

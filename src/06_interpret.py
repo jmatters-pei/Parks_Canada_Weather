@@ -14,6 +14,7 @@ import pandas as pd
 import seaborn as sns
 
 from config import (
+    ECCC_FWI_CACHE_DIR,
     FIGURES_DIR,
     FWI_SEASON_MONTHS,
     INTERPRET_ALPHA,
@@ -37,15 +38,16 @@ from config import (
 
 matplotlib.use("Agg")
 
-INPUT_HOURLY = SCRUBBED_DIR / "hourly_weather_utc.csv"
-INPUT_DAILY_FWI = TABLES_DIR / "model_fwi_daily.csv"
-INPUT_BENCHMARKS = TABLES_DIR / "model_hourly_benchmarks.csv"
-INPUT_PCA_LOADINGS = TABLES_DIR / "model_pca_loadings.csv"
-INPUT_PCA_EXPLAINED = TABLES_DIR / "model_pca_explained_variance.csv"
+INPUT_HOURLY = SCRUBBED_DIR / "02_hourly_weather_utc.csv"
+INPUT_DAILY_FWI = TABLES_DIR / "04_model_fwi_daily.csv"
+INPUT_BENCHMARKS = TABLES_DIR / "05_model_hourly_benchmarks.csv"
+INPUT_PCA_LOADINGS = TABLES_DIR / "05_model_pca_loadings.csv"
+INPUT_PCA_EXPLAINED = TABLES_DIR / "05_model_pca_explained_variance.csv"
 
-OUTPUT_RISK_TABLE = TABLES_DIR / "interpret_redundancy_risk.csv"
-OUTPUT_KDE_FIGURE = FIGURES_DIR / "interpret_kde_error_distribution.png"
-OUTPUT_FINDINGS_MD = PLANS_DIR / "07_interpret_findings.md"
+OUTPUT_RISK_TABLE = TABLES_DIR / "06_interpret_redundancy_risk.csv"
+OUTPUT_KDE_FIGURE = FIGURES_DIR / "06_interpret_kde_error_distribution.png"
+OUTPUT_FINDINGS_MD = PLANS_DIR / "06_interpret_findings.md"
+OUTPUT_FWI_CORRELATIONS = TABLES_DIR / "06_interpret_fwi_true_stanhope_correlations.csv"
 
 HALIFAX_TZ = ZoneInfo("America/Halifax")
 WINDOWS = ["overall", "winter", "spring", "summer", "fall", "fwi_season"]
@@ -128,6 +130,147 @@ def load_daily(path: Path) -> pd.DataFrame:
 
     daily["month_local"] = daily["date_local"].dt.month
     return daily.sort_values(["station_slug", "date_local"]).reset_index(drop=True)
+
+
+def load_true_stanhope_fwi(reference_dir: Path) -> pd.DataFrame:
+    """Load official (true) Stanhope daily FWI series from cached ECCC files."""
+    if not reference_dir.exists():
+        raise FileNotFoundError(f"Stanhope FWI reference directory is missing: {reference_dir}")
+
+    files = sorted(reference_dir.glob("*.csv"))
+    if not files:
+        raise FileNotFoundError(f"No Stanhope FWI CSV files found in: {reference_dir}")
+
+    frames: List[pd.DataFrame] = []
+    for file_path in files:
+        frame = pd.read_csv(file_path, low_memory=False)
+        required = ["Date", "FWI"]
+        missing = [col for col in required if col not in frame.columns]
+        if missing:
+            raise ValueError(f"Reference file {file_path} is missing columns: {missing}")
+
+        frame = frame[required].copy()
+        frame["date_local"] = pd.to_datetime(frame["Date"], errors="coerce").dt.date
+        bad_dates = int(frame["date_local"].isna().sum())
+        if bad_dates > 0:
+            raise ValueError(f"Reference file {file_path} has {bad_dates} invalid Date values")
+
+        frame["fwi_true_stanhope"] = pd.to_numeric(frame["FWI"], errors="coerce")
+        frames.append(frame[["date_local", "fwi_true_stanhope"]])
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.dropna(subset=["date_local"]).drop_duplicates(subset=["date_local"], keep="last")
+    out["month_local"] = pd.to_datetime(out["date_local"]).dt.month
+    return out.sort_values(["date_local"]).reset_index(drop=True)
+
+
+def load_modeled_fwi_series(path: Path) -> pd.DataFrame:
+    """Load modeled daily FWI series for all stations (FWI only) from Step 5 output."""
+    if not path.exists():
+        raise FileNotFoundError(f"Required modeled daily file is missing: {path}")
+
+    df = pd.read_csv(path, low_memory=False)
+    required = ["station_slug", "date_local", "fwi"]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise ValueError(f"Modeled daily file is missing columns required for correlation: {missing}")
+
+    df["date_local"] = pd.to_datetime(df["date_local"], errors="coerce").dt.date
+    bad_dates = int(pd.isna(df["date_local"]).sum())
+    if bad_dates > 0:
+        raise ValueError(f"Modeled daily file has {bad_dates} invalid date_local values")
+
+    df["fwi_modeled"] = pd.to_numeric(df["fwi"], errors="coerce")
+    df["month_local"] = pd.to_datetime(df["date_local"]).dt.month
+    df = df[["station_slug", "date_local", "month_local", "fwi_modeled"]].copy()
+    return df.sort_values(["station_slug", "date_local"]).reset_index(drop=True)
+
+
+def build_fwi_true_correlations(
+    modeled_fwi: pd.DataFrame,
+    true_stanhope: pd.DataFrame,
+    *,
+    min_pairs: int,
+) -> pd.DataFrame:
+    """Compute Pearson/Spearman correlations of modeled station FWI vs true Stanhope FWI."""
+    rows: List[Dict[str, object]] = []
+
+    station_slugs = sorted(modeled_fwi["station_slug"].dropna().astype(str).unique().tolist())
+    for station in station_slugs:
+        station_df = modeled_fwi[modeled_fwi["station_slug"].astype(str) == station].copy()
+        station_df = station_df.dropna(subset=["fwi_modeled"])  # eligible modeled days only
+        if station_df.empty:
+            for window in WINDOWS:
+                rows.append(
+                    {
+                        "station_slug": station,
+                        "window": window,
+                        "n_pairs": 0,
+                        "pearson_r": np.nan,
+                        "spearman_r": np.nan,
+                        "status": "skipped_insufficient_overlap",
+                        "reason": "no modeled FWI values available",
+                    }
+                )
+            continue
+
+        joined_all = station_df.merge(
+            true_stanhope[["date_local", "fwi_true_stanhope"]],
+            on="date_local",
+            how="inner",
+        ).dropna(subset=["fwi_modeled", "fwi_true_stanhope"])
+
+        if not joined_all.empty:
+            joined_all["month_local"] = pd.to_datetime(joined_all["date_local"]).dt.month
+
+        for window in WINDOWS:
+            if joined_all.empty:
+                n_pairs = 0
+                rows.append(
+                    {
+                        "station_slug": station,
+                        "window": window,
+                        "n_pairs": n_pairs,
+                        "pearson_r": np.nan,
+                        "spearman_r": np.nan,
+                        "status": "skipped_insufficient_overlap",
+                        "reason": "no overlapping dates with true Stanhope series",
+                    }
+                )
+                continue
+
+            subset = joined_all.loc[_window_mask(joined_all, window)].copy()
+            n_pairs = int(len(subset))
+            if n_pairs < min_pairs:
+                rows.append(
+                    {
+                        "station_slug": station,
+                        "window": window,
+                        "n_pairs": n_pairs,
+                        "pearson_r": np.nan,
+                        "spearman_r": np.nan,
+                        "status": "skipped_insufficient_overlap",
+                        "reason": f"insufficient overlap (n_pairs={n_pairs} < {min_pairs})",
+                    }
+                )
+                continue
+
+            pearson_r = float(subset["fwi_modeled"].corr(subset["fwi_true_stanhope"]))
+            spearman_r = float(subset["fwi_modeled"].rank().corr(subset["fwi_true_stanhope"].rank()))
+            rows.append(
+                {
+                    "station_slug": station,
+                    "window": window,
+                    "n_pairs": n_pairs,
+                    "pearson_r": pearson_r,
+                    "spearman_r": spearman_r,
+                    "status": "ok",
+                    "reason": "",
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    return out.sort_values(["station_slug", "window"]).reset_index(drop=True)
 
 
 def _rmse(values: np.ndarray) -> float:
@@ -523,7 +666,7 @@ def write_findings_markdown(
     lines: List[str] = []
     generated_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    lines.append("# 07_interpret_findings.md")
+    lines.append("# 06_interpret_findings.md")
     lines.append("")
     lines.append("## Phase 7 Interpretation Findings")
     lines.append("")
@@ -583,7 +726,7 @@ def write_findings_markdown(
     lines.append("")
     lines.append("- KDE curves visualize delta distributions only; exceedance probabilities are based on ECDF rates.")
     lines.append("- Precipitation distributions are often zero-inflated, so KDE shape is only a supporting visual cue.")
-    lines.append("- See figure: outputs/figures/interpret_kde_error_distribution.png")
+    lines.append("- See figure: outputs/figures/06_interpret_kde_error_distribution.png")
     lines.append("")
 
     lines.append("### PCA Context (Phase 6)")
@@ -636,7 +779,7 @@ def write_findings_markdown(
     lines.append("### Next Step Contract")
     lines.append("")
     lines.append(
-        "- Use outputs/tables/interpret_redundancy_risk.csv as the decision table for any station rationalization action."
+        "- Use outputs/tables/06_interpret_redundancy_risk.csv as the decision table for any station rationalization action."
     )
     lines.append(
         "- If any candidate is Not Safe to Remove, retain that station and prioritize targeted maintenance or variable-specific backup design."
@@ -656,6 +799,14 @@ def main() -> int:
 
     hourly = load_hourly(INPUT_HOURLY)
     daily = load_daily(INPUT_DAILY_FWI)
+
+    modeled_fwi = load_modeled_fwi_series(INPUT_DAILY_FWI)
+    true_stanhope = load_true_stanhope_fwi(ECCC_FWI_CACHE_DIR)
+    correlations = build_fwi_true_correlations(
+        modeled_fwi,
+        true_stanhope,
+        min_pairs=INTERPRET_MIN_ALIGNED_DAILY_PER_WINDOW,
+    )
 
     rng = np.random.default_rng(INTERPRET_RANDOM_SEED)
 
@@ -695,6 +846,9 @@ def main() -> int:
     OUTPUT_RISK_TABLE.parent.mkdir(parents=True, exist_ok=True)
     risk_df.to_csv(OUTPUT_RISK_TABLE, index=False)
 
+    OUTPUT_FWI_CORRELATIONS.parent.mkdir(parents=True, exist_ok=True)
+    correlations.to_csv(OUTPUT_FWI_CORRELATIONS, index=False)
+
     if not kde_df.empty:
         build_kde_figure(kde_df, OUTPUT_KDE_FIGURE)
 
@@ -705,6 +859,7 @@ def main() -> int:
 
     decision_counts = risk_df[["candidate_station_slug", "decision_safe_to_remove"]].drop_duplicates()
     logger.info("Wrote table: %s", OUTPUT_RISK_TABLE)
+    logger.info("Wrote table: %s", OUTPUT_FWI_CORRELATIONS)
     if not kde_df.empty:
         logger.info("Wrote figure: %s", OUTPUT_KDE_FIGURE)
     logger.info("Wrote findings: %s", OUTPUT_FINDINGS_MD)

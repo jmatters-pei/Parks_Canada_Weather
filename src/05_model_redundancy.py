@@ -36,13 +36,13 @@ from config import (
 
 matplotlib.use("Agg")
 
-INPUT_HOURLY = SCRUBBED_DIR / "hourly_weather_utc.csv"
-OUTPUT_EXPLAINED = TABLES_DIR / "model_pca_explained_variance.csv"
-OUTPUT_LOADINGS = TABLES_DIR / "model_pca_loadings.csv"
-OUTPUT_SCORES = TABLES_DIR / "model_pca_scores.csv"
-OUTPUT_STATION_SUMMARY = TABLES_DIR / "model_pca_station_summary.csv"
-OUTPUT_BENCHMARKS = TABLES_DIR / "model_hourly_benchmarks.csv"
-OUTPUT_BIPLOT = FIGURES_DIR / "model_pca_biplot.png"
+INPUT_HOURLY = SCRUBBED_DIR / "02_hourly_weather_utc.csv"
+OUTPUT_EXPLAINED = TABLES_DIR / "05_model_pca_explained_variance.csv"
+OUTPUT_LOADINGS = TABLES_DIR / "05_model_pca_loadings.csv"
+OUTPUT_SCORES = TABLES_DIR / "05_model_pca_scores.csv"
+OUTPUT_STATION_SUMMARY = TABLES_DIR / "05_model_pca_station_summary.csv"
+OUTPUT_BENCHMARKS = TABLES_DIR / "05_model_hourly_benchmarks.csv"
+OUTPUT_BIPLOT = FIGURES_DIR / "05_model_pca_biplot.png"
 
 HALIFAX_TZ = ZoneInfo("America/Halifax")
 

@@ -73,10 +73,10 @@ STATUS_SKIPPED_UNCHANGED = "skipped_unchanged"
 STATUS_FAILED_READ = "failed_read"
 STATUS_FAILED_DOWNLOAD = "failed_download"
 
-HOBOLINK_MANIFEST = MANIFEST_DIR / "obtain_hobolink_files.csv"
-ECCC_MANIFEST = MANIFEST_DIR / "obtain_eccc_periods.csv"
-ECCC_FWI_MANIFEST = MANIFEST_DIR / "obtain_eccc_fwi_daily_periods.csv"
-SCHEMA_INVENTORY = MANIFEST_DIR / "schema_inventory.csv"
+HOBOLINK_MANIFEST = MANIFEST_DIR / "01_obtain_hobolink_files.csv"
+ECCC_MANIFEST = MANIFEST_DIR / "01_obtain_eccc_periods.csv"
+ECCC_FWI_MANIFEST = MANIFEST_DIR / "01_obtain_eccc_fwi_daily_periods.csv"
+SCHEMA_INVENTORY = MANIFEST_DIR / "01_schema_inventory.csv"
 OBTAIN_LOCK_PATH = LOGS_DIR / "01_obtain.lock"
 
 CSV_MIME_HINTS = (
