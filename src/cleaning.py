@@ -1,9 +1,3 @@
-"""Combined obtain + scrub pipeline entrypoint (self-contained).
-
-This script intentionally duplicates key logic from Step 2 (obtain) and Step 3 (scrub)
-without importing other repo modules, so it can run independently.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -24,7 +18,7 @@ import pandas as pd
 import requests
 
 # -----------------------------------------------------------------------------
-# Copied/adapted configuration constants (do not import config.py)
+# Configuration constants
 # -----------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -153,17 +147,24 @@ CANONICAL_ORDER = [
     CANONICAL_VARIABLES["rain"],
 ]
 
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
+
 
 def utc_now_iso() -> str:
+    """Return current UTC timestamp in stable ISO format for manifests/logs."""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def station_slug(station_name: str) -> str:
+    """Convert a human-readable station name into a filesystem-safe identifier."""
     slug = re.sub(r"[^A-Za-z0-9]+", "_", str(station_name).strip())
     return slug.strip("_")
 
 
 def setup_logging(log_path: Path) -> logging.Logger:
+    """Configure one shared logger that writes to console and a daily log file."""
     logger = logging.getLogger("cleaning")
     if logger.handlers:
         return logger
@@ -187,6 +188,7 @@ def setup_logging(log_path: Path) -> logging.Logger:
 
 
 def ensure_directories(raw_dir: Path, scrubbed_dir: Path, outputs_dir: Path) -> None:
+    """Create required output folders so downstream writes never fail on missing paths."""
     (scrubbed_dir / "_manifests").mkdir(parents=True, exist_ok=True)
     (outputs_dir / "logs").mkdir(parents=True, exist_ok=True)
     (outputs_dir / "figures").mkdir(parents=True, exist_ok=True)
@@ -195,6 +197,7 @@ def ensure_directories(raw_dir: Path, scrubbed_dir: Path, outputs_dir: Path) -> 
 
 
 def compute_sha256(file_path: Path, chunk_size: int = 1024 * 1024) -> str:
+    """Compute a content hash used to fingerprint source files in manifests."""
     hasher = hashlib.sha256()
     with file_path.open("rb") as handle:
         while True:
@@ -206,6 +209,7 @@ def compute_sha256(file_path: Path, chunk_size: int = 1024 * 1024) -> str:
 
 
 def response_looks_like_csv(response: requests.Response, csv_mime_hints: tuple[str, ...]) -> bool:
+    """Reject HTML/error pages and keep only responses that look structurally like CSV."""
     content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
     if "text/html" in content_type:
         return False
@@ -239,6 +243,7 @@ def download_to_file_atomic(
     csv_mime_hints: tuple[str, ...],
     timeout_seconds: int = 60,
 ) -> None:
+    """Download text payload and atomically replace destination to avoid partial files."""
     response = requests.get(url, timeout=timeout_seconds)
     response.raise_for_status()
 
@@ -254,6 +259,7 @@ def download_to_file_atomic(
 
 
 def get_eccc_download_mode(climate_id: int, probe_year: int, logger: logging.Logger) -> str:
+    """Probe ECCC endpoint capabilities (currently informational; monthly flow is used)."""
     annual_url = (
         "https://climate.weather.gc.ca/climate_data/bulk_data_e.html"
         f"?format=csv&climate_id={climate_id}&Year={probe_year}&timeframe=1"
@@ -271,12 +277,14 @@ def get_eccc_download_mode(climate_id: int, probe_year: int, logger: logging.Log
 
 
 def previous_month(year: int, month: int) -> Tuple[int, int]:
+    """Return the previous calendar month as (year, month)."""
     if month == 1:
         return year - 1, 12
     return year, month - 1
 
 
 def build_required_month_periods(start_year: int, end_year: int) -> List[Tuple[int, int]]:
+    """Build month periods between start/end years, capped at the current UTC month."""
     now_utc = datetime.now(timezone.utc)
     capped_end_year = min(end_year, now_utc.year)
     periods: List[Tuple[int, int]] = []
@@ -290,6 +298,7 @@ def build_required_month_periods(start_year: int, end_year: int) -> List[Tuple[i
 
 
 def recent_refresh_periods() -> set[Tuple[int, int]]:
+    """Return current and previous month so recent ECCC data can be refreshed."""
     now_utc = datetime.now(timezone.utc)
     current = (now_utc.year, now_utc.month)
     previous = previous_month(now_utc.year, now_utc.month)
@@ -297,6 +306,7 @@ def recent_refresh_periods() -> set[Tuple[int, int]]:
 
 
 def build_eccc_url(climate_id: int, year: int, month: Optional[int]) -> str:
+    """Create an ECCC bulk CSV URL for hourly data at monthly resolution."""
     base = (
         "https://climate.weather.gc.ca/climate_data/bulk_data_e.html"
         f"?format=csv&climate_id={climate_id}&Year={year}&timeframe=1"
@@ -315,6 +325,7 @@ def download_eccc_periods(
     logger: logging.Logger,
     dry_run: bool,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    """Download/refresh Stanhope hourly ECCC CSVs and return manifest + schema rows."""
     manifest_rows: List[Dict[str, object]] = []
     schema_rows: List[Dict[str, object]] = []
 
@@ -330,6 +341,7 @@ def download_eccc_periods(
         should_refresh = (year, month) in refresh_set
 
         if destination.exists() and not should_refresh:
+            # Reuse historical files outside the rolling refresh window.
             size_bytes = destination.stat().st_size
             sha256_value = compute_sha256(destination)
             schema_status, error_message, schema_hash, columns = inspect_csv_schema(destination, "eccc")
@@ -357,6 +369,7 @@ def download_eccc_periods(
 
             url = build_eccc_url(climate_id=climate_id, year=year, month=month)
             try:
+                # Download first, then inspect schema before marking the file as usable.
                 download_to_file_atomic(url=url, destination=destination, csv_mime_hints=CSV_MIME_HINTS)
                 size_bytes = destination.stat().st_size
                 sha256_value = compute_sha256(destination)
@@ -408,11 +421,13 @@ def download_eccc_periods(
 
 
 def schema_hash_from_columns(columns: List[str]) -> str:
+    """Generate a deterministic hash for a column layout to track schema drift."""
     payload = json.dumps({"columns": columns}, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _read_scanned_rows(csv_path: Path, max_scan_lines: int = 100) -> Tuple[List[List[str]], str]:
+    """Read a small CSV sample with fallback encodings for robust header detection."""
     last_error: Optional[Exception] = None
     for encoding in READ_ENCODINGS:
         try:
@@ -433,6 +448,7 @@ def _read_scanned_rows(csv_path: Path, max_scan_lines: int = 100) -> Tuple[List[
 
 
 def _normalize_header_columns(raw_columns: List[str]) -> List[str]:
+    """Trim blank/duplicate header names and make duplicate names explicit."""
     cleaned: List[str] = []
     for i, column in enumerate(raw_columns, start=1):
         text = str(column).strip()
@@ -452,6 +468,7 @@ def _normalize_header_columns(raw_columns: List[str]) -> List[str]:
 
 
 def detect_header_and_columns(csv_path: Path, max_scan_lines: int = 100) -> Tuple[int, List[str]]:
+    """Detect likely header row and return normalized column names."""
     rows, _ = _read_scanned_rows(csv_path, max_scan_lines=max_scan_lines)
 
     candidate_row: Optional[int] = None
@@ -487,6 +504,7 @@ def detect_header_and_columns(csv_path: Path, max_scan_lines: int = 100) -> Tupl
 
 
 def validate_timestamp_columns(source: str, columns: List[str]) -> None:
+    """Enforce timestamp column requirements per source system."""
     lower_columns = {column.strip().lower() for column in columns}
     if source == "hobolink":
         has_split = "date" in lower_columns and "time" in lower_columns
@@ -506,6 +524,7 @@ def validate_timestamp_columns(source: str, columns: List[str]) -> None:
 
 
 def validate_required_fwi_columns(columns: List[str]) -> None:
+    """Verify expected daily FWI code fields are present before accepting the file."""
     normalized = [re.sub(r"[^a-z0-9]+", "", column.lower()) for column in columns]
     has_date = any("date" in column for column in normalized)
     if not has_date:
@@ -521,6 +540,7 @@ def validate_required_fwi_columns(columns: List[str]) -> None:
 
 
 def inspect_csv_schema(csv_path: Path, source: str) -> Tuple[str, Optional[str], Optional[str], Optional[List[str]]]:
+    """Run lightweight schema checks and return status, errors, and schema fingerprint."""
     if not csv_path.exists() or csv_path.stat().st_size <= 0:
         return STATUS_FAILED_READ, "File does not exist or is empty.", None, None
     try:
@@ -546,6 +566,7 @@ def create_manifest_row(
     error_message: Optional[str],
     schema_hash: Optional[str],
 ) -> Dict[str, object]:
+    """Build one standard manifest record used by obtain/scrub lineage tracking."""
     return {
         "source": source,
         "station_raw": station_raw,
@@ -564,6 +585,7 @@ def create_manifest_row(
 
 
 def extract_year(text: str) -> Optional[int]:
+    """Extract the first four-digit year from text if present."""
     match = re.search(r"(19|20)\d{2}", text)
     if match:
         return int(match.group())
@@ -571,6 +593,7 @@ def extract_year(text: str) -> Optional[int]:
 
 
 def status_is_usable(status: object) -> bool:
+    """Treat any non-failed status as eligible for downstream processing."""
     if pd.isna(status):
         return False
     text = str(status).strip().lower()
@@ -580,6 +603,7 @@ def status_is_usable(status: object) -> bool:
 
 
 def find_hobolink_datetime_columns(columns: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Locate HOBOlink datetime fields (combined or split date/time columns)."""
     lowered = {column.lower(): column for column in columns}
 
     combined_candidates = ["date/time", "date time", "datetime", "timestamp"]
@@ -596,6 +620,7 @@ def find_hobolink_datetime_columns(columns: List[str]) -> Tuple[Optional[str], O
 
 
 def read_hobolink_datetime_bounds(csv_path: Path) -> Optional[Tuple[date, date]]:
+    """Read only datetime bounds from a HOBOlink file for coverage planning."""
     header_row, columns = detect_header_and_columns(csv_path)
     datetime_col, date_col, time_col = find_hobolink_datetime_columns(columns)
     if datetime_col is None and (date_col is None or time_col is None):
@@ -638,6 +663,7 @@ def read_hobolink_datetime_bounds(csv_path: Path) -> Optional[Tuple[date, date]]
 def derive_hobolink_coverage_bounds(
     hobolink_rows: List[Dict[str, object]], logger: logging.Logger
 ) -> Optional[Tuple[date, date]]:
+    """Estimate global HOBOlink start/end dates across all usable files."""
     min_seen: Optional[date] = None
     max_seen: Optional[date] = None
     scanned_files = 0
@@ -681,7 +707,12 @@ def derive_hobolink_coverage_bounds(
     return min_seen, max_seen
 
 
+# -----------------------------------------------------------------------------
+# FWI scientific formulas and data extraction helpers
+# -----------------------------------------------------------------------------
+
 def rh_from_dewpoint(temperature_c: float, dew_point_c: float) -> float:
+    """Estimate relative humidity from temperature and dew point when RH is absent."""
     return 100 * math.exp(
         (17.625 * dew_point_c / (243.04 + dew_point_c))
         - (17.625 * temperature_c / (243.04 + temperature_c))
@@ -689,6 +720,7 @@ def rh_from_dewpoint(temperature_c: float, dew_point_c: float) -> float:
 
 
 def ffmc_code(temp_c: float, rh_pct: float, wind_kmh: float, rain_mm: float, ffmc_prev: float) -> float:
+    """Compute the Fine Fuel Moisture Code (FFMC) for one day."""
     mo = 147.2 * (101 - ffmc_prev) / (59.5 + ffmc_prev)
     if rain_mm > 0.5:
         rf = rain_mm - 0.5
@@ -720,6 +752,7 @@ def ffmc_code(temp_c: float, rh_pct: float, wind_kmh: float, rain_mm: float, ffm
 
 
 def dmc_code(temp_c: float, rh_pct: float, rain_mm: float, dmc_prev: float, month: int) -> float:
+    """Compute the Duff Moisture Code (DMC) for one day."""
     day_length_factors = [6.5, 7.5, 9.0, 12.8, 13.9, 13.9, 12.4, 10.9, 9.4, 8.0, 7.8, 6.3]
     if temp_c < -1.1:
         temp_c = -1.1
@@ -751,6 +784,7 @@ def dmc_code(temp_c: float, rh_pct: float, rain_mm: float, dmc_prev: float, mont
 
 
 def dc_code(temp_c: float, rain_mm: float, dc_prev: float, month: int) -> float:
+    """Compute the Drought Code (DC) for one day."""
     seasonal_factors = [-1.6, -1.6, -1.6, 0.9, 3.8, 5.8, 6.4, 5.0, 2.4, 0.4, -1.6, -1.6]
     if temp_c < -2.8:
         temp_c = -2.8
@@ -778,12 +812,14 @@ def dc_code(temp_c: float, rain_mm: float, dc_prev: float, month: int) -> float:
 
 
 def isi_index(wind_kmh: float, ffmc_value: float) -> float:
+    """Compute Initial Spread Index (ISI) from wind and FFMC."""
     fuel_moisture = 147.2 * (101 - ffmc_value) / (59.5 + ffmc_value)
     spread_factor = 19.115 * math.exp(-0.1386 * fuel_moisture) * (1 + fuel_moisture**5.31 / 4.93e7)
     return spread_factor * math.exp(0.05039 * wind_kmh)
 
 
 def bui_index(dmc_value: float, dc_value: float) -> float:
+    """Compute Build-Up Index (BUI) from DMC and DC."""
     denominator = dmc_value + 0.4 * dc_value
     if denominator <= 0:
         return 0.0
@@ -794,6 +830,7 @@ def bui_index(dmc_value: float, dc_value: float) -> float:
 
 
 def fwi_index(isi_value: float, bui_value: float) -> float:
+    """Compute final Fire Weather Index (FWI) from ISI and BUI."""
     if bui_value <= 80:
         bb = 0.1 * isi_value * (0.626 * bui_value**0.809 + 2)
     else:
@@ -804,6 +841,7 @@ def fwi_index(isi_value: float, bui_value: float) -> float:
 
 
 def fetch_hourly_range(climate_id: int | str, start_dt: str, end_dt: str, logger: logging.Logger) -> List[Dict[str, object]]:
+    """Fetch paged hourly records from ECCC API with retry and progress logging."""
     records: List[Dict[str, object]] = []
     offset = 0
     expected_total: Optional[int] = None
@@ -877,6 +915,7 @@ def fetch_hourly_range(climate_id: int | str, start_dt: str, end_dt: str, logger
 
 
 def parse_local_datetime(local_date_text: str) -> Optional[datetime]:
+    """Parse LOCAL_DATE text from API payloads into Python datetime."""
     text = str(local_date_text).strip()
     if not text:
         return None
@@ -890,6 +929,7 @@ def parse_local_datetime(local_date_text: str) -> Optional[datetime]:
 
 
 def extract_daily_fwi_inputs(records: List[Dict[str, object]]) -> Dict[str, Dict[str, float]]:
+    """Construct noon-based daily FWI inputs from hourly API records."""
     by_dt: Dict[datetime, Dict[str, object]] = {}
     for feature in records:
         properties = feature.get("properties")
@@ -909,6 +949,7 @@ def extract_daily_fwi_inputs(records: List[Dict[str, object]]) -> Dict[str, Dict
     for day in dates:
         noon_properties: Optional[Dict[str, object]] = None
         for hour in (12, 11, 13):
+            # Prefer strict noon, but accept +/- 1 hour fallback if noon is missing.
             candidate = datetime(day.year, day.month, day.day, hour)
             if candidate in by_dt:
                 noon_properties = by_dt[candidate]
@@ -950,6 +991,7 @@ def extract_daily_fwi_inputs(records: List[Dict[str, object]]) -> Dict[str, Dict
 
 
 def compute_fwi_daily_records(daily_inputs: Dict[str, Dict[str, float]]) -> List[Dict[str, object]]:
+    """Run sequential daily FWI calculations over a season (stateful moisture codes)."""
     ffmc_value = FFMC_START
     dmc_value = DMC_START
     dc_value = DC_START
@@ -992,6 +1034,7 @@ def compute_fwi_daily_records(daily_inputs: Dict[str, Dict[str, float]]) -> List
 
 
 def get_fwi_date_bounds(csv_path: Path) -> Optional[Tuple[date, date]]:
+    """Get first/last dates from a precomputed daily FWI CSV."""
     try:
         frame = pd.read_csv(csv_path, usecols=["Date"])
     except Exception:  # noqa: BLE001
@@ -1018,6 +1061,7 @@ def compute_stanhope_fwi_daily_file(
     destination: Path,
     logger: logging.Logger,
 ) -> Tuple[str, int, str, Optional[str], Optional[str], Optional[List[str]]]:
+    """Compute one year of Stanhope daily FWI and save to CSV with schema checks."""
     start_dt = f"{start_date:%Y-%m-%d}T00:00:00"
     end_dt = f"{end_date:%Y-%m-%d}T23:59:59"
 
@@ -1065,6 +1109,7 @@ def download_eccc_fwi_daily_periods(
     logger: logging.Logger,
     dry_run: bool,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    """Create/update annual Stanhope daily FWI files and their manifest rows."""
     manifest_rows: List[Dict[str, object]] = []
     schema_rows: List[Dict[str, object]] = []
 
@@ -1169,6 +1214,7 @@ def download_eccc_fwi_daily_periods(
 
 
 def update_schema_inventory(schema_records: List[Dict[str, object]], schema_inventory_path: Path) -> None:
+    """Append and de-duplicate observed schemas over time for data governance."""
     if not schema_records:
         return
     now_utc = utc_now_iso()
@@ -1204,6 +1250,10 @@ def update_schema_inventory(schema_records: List[Dict[str, object]], schema_inve
     merged.to_csv(schema_inventory_path, index=False)
 
 
+# -----------------------------------------------------------------------------
+# Obtain stage: discover local files + optionally fetch online ECCC datasets
+# -----------------------------------------------------------------------------
+
 def run_obtain(
     raw_dir: Path,
     manifest_dir: Path,
@@ -1213,12 +1263,14 @@ def run_obtain(
     end_year: Optional[int],
     skip_eccc_download: bool,
 ) -> pd.DataFrame:
+    """Build source inventory and manifests used as the scrub stage input contract."""
     manifest_dir.mkdir(parents=True, exist_ok=True)
     schema_records: List[Dict[str, object]] = []
 
     hobolink_rows: List[Dict[str, object]] = []
     hobolink_years: List[int] = []
     for station in HOBOLINK_STATIONS:
+        # Walk each station tree and register every CSV with schema diagnostics.
         station_dir = raw_dir / station
         if not station_dir.exists():
             logger.warning("Missing HOBOlink drop-zone: %s", station_dir)
@@ -1325,11 +1377,17 @@ def run_obtain(
     return inventory
 
 
+# -----------------------------------------------------------------------------
+# Scrub stage helpers: parse, map columns, normalize precipitation and aggregate
+# -----------------------------------------------------------------------------
+
 def normalize_header_columns(raw_columns: Iterable[str]) -> List[str]:
+    """Public wrapper for header normalization helper."""
     return _normalize_header_columns(list(raw_columns))
 
 
 def detect_hobolink_header_and_encoding(csv_path: Path, max_scan_lines: int = 120) -> Tuple[int, str]:
+    """Infer HOBOlink header row index and text encoding from a short scan."""
     for encoding in READ_ENCODINGS:
         try:
             with csv_path.open("r", encoding=encoding, newline="") as handle:
@@ -1361,6 +1419,7 @@ def detect_hobolink_header_and_encoding(csv_path: Path, max_scan_lines: int = 12
 
 
 def find_column(df: pd.DataFrame, required_tokens: List[str], banned_tokens: List[str] | None = None) -> List[str]:
+    """Find columns whose names contain all required tokens and none of the banned tokens."""
     banned_tokens = banned_tokens or []
     matches: List[str] = []
     for col in df.columns:
@@ -1371,10 +1430,12 @@ def find_column(df: pd.DataFrame, required_tokens: List[str], banned_tokens: Lis
 
 
 def numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
+    """Convert a dataframe column to numeric, coercing bad values to NaN."""
     return pd.to_numeric(df[column], errors="coerce")
 
 
 def choose_best_column(df: pd.DataFrame, candidates: List[str]) -> str | None:
+    """Pick candidate with the highest usable numeric ratio."""
     if not candidates:
         return None
     best_name = None
@@ -1388,6 +1449,7 @@ def choose_best_column(df: pd.DataFrame, candidates: List[str]) -> str | None:
 
 
 def parse_hobolink_file(path: Path, row: pd.Series, logger: logging.Logger) -> Tuple[pd.DataFrame, List[Dict[str, object]]]:
+    """Parse one HOBOlink CSV into canonical weather variables in UTC."""
     header_row, encoding = detect_hobolink_header_and_encoding(path)
     raw = pd.read_csv(
         path,
@@ -1401,6 +1463,7 @@ def parse_hobolink_file(path: Path, row: pd.Series, logger: logging.Logger) -> T
     raw.columns = normalize_header_columns(raw.columns)
 
     if "Date" in raw.columns and "Time" in raw.columns:
+        # First try strict timestamp format; fall back if too many parse failures.
         dt_text = raw["Date"].astype(str).str.strip() + " " + raw["Time"].astype(str).str.strip()
         timestamp = pd.to_datetime(dt_text, format="%m/%d/%Y %H:%M:%S %z", errors="coerce", utc=True)
         if float(timestamp.isna().mean()) > 0.05:
@@ -1495,6 +1558,7 @@ def parse_hobolink_file(path: Path, row: pd.Series, logger: logging.Logger) -> T
 
 
 def parse_eccc_file(path: Path, row: pd.Series) -> pd.DataFrame:
+    """Parse one ECCC hourly CSV and map source fields to canonical names."""
     raw = pd.read_csv(path, na_values=NA_STRINGS, keep_default_na=True, low_memory=False)
 
     if "Date/Time (LST)" not in raw.columns:
@@ -1523,6 +1587,7 @@ def parse_eccc_file(path: Path, row: pd.Series) -> pd.DataFrame:
 
 
 def classify_and_normalize_precip(series: pd.Series, source: str) -> Tuple[pd.Series, Dict[str, object]]:
+    """Detect whether precipitation is cumulative and convert to hourly increments if needed."""
     precip = pd.to_numeric(series, errors="coerce")
 
     if source == "eccc":
@@ -1572,6 +1637,7 @@ def classify_and_normalize_precip(series: pd.Series, source: str) -> Tuple[pd.Se
 
 
 def aggregate_hourly(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate parsed observations to hourly resolution by station/source."""
     if df.empty:
         return df
 
@@ -1584,6 +1650,7 @@ def aggregate_hourly(df: pd.DataFrame) -> pd.DataFrame:
     wind_dir_col = CANONICAL_VARIABLES["wind_dir"]
 
     valid_dir = work[wind_dir_col].notna() & work[wind_speed_col].notna() & (work[wind_speed_col] > 0)
+    # Convert direction+speed into vector components for circular averaging.
     rad = work[wind_dir_col].astype(float).map(math.radians)
     work["_wind_x"] = pd.NA
     work["_wind_y"] = pd.NA
@@ -1627,6 +1694,7 @@ def aggregate_hourly(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def missing_run_lengths(mask: pd.Series) -> List[int]:
+    """Return lengths of contiguous missing-value runs."""
     lengths: List[int] = []
     run = 0
     for value in mask.fillna(False).tolist():
@@ -1641,6 +1709,7 @@ def missing_run_lengths(mask: pd.Series) -> List[int]:
 
 
 def short_gap_mask(series: pd.Series, max_gap: int = 2) -> pd.Series:
+    """Flag interior missing runs whose lengths are small enough to be filled safely."""
     missing = series.isna()
     eligible = pd.Series(False, index=series.index, dtype="boolean")
     i = 0
@@ -1661,6 +1730,7 @@ def short_gap_mask(series: pd.Series, max_gap: int = 2) -> pd.Series:
 
 
 def apply_step_filter(series: pd.Series, threshold: float) -> Tuple[pd.Series, pd.Series]:
+    """Drop implausible jumps by comparing each value to previous valid observation."""
     values = pd.to_numeric(series, errors="coerce").copy()
     failed = pd.Series(False, index=values.index, dtype="boolean")
     previous_valid = None
@@ -1679,6 +1749,7 @@ def apply_step_filter(series: pd.Series, threshold: float) -> Tuple[pd.Series, p
 
 
 def apply_qc_and_fill(station_df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict[str, object]]]:
+    """Apply range/step QC rules and fill only short interior gaps (<=2 hours)."""
     df = station_df.copy().sort_values("datetime_utc").reset_index(drop=True)
     qc_rows: List[Dict[str, object]] = []
 
@@ -1722,6 +1793,7 @@ def apply_qc_and_fill(station_df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict
         df.loc[failed, f"{var}_failed_qc"] = True
 
     for var in CONTINUOUS_FILL_VARS:
+        # Policy: interpolate only short interior gaps so long outages remain visible.
         before_missing = df[var].isna()
         filled = pd.to_numeric(df[var], errors="coerce").interpolate(method="linear", limit=2, limit_area="inside")
         df[var] = filled
@@ -1753,6 +1825,7 @@ def apply_qc_and_fill(station_df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict
 
 
 def build_complete_hourly_grid(station_df: pd.DataFrame) -> pd.DataFrame:
+    """Expand a station series to a complete hourly timeline between min/max timestamps."""
     if station_df.empty:
         return station_df
     station_df = station_df.sort_values("datetime_utc").reset_index(drop=True)
@@ -1768,6 +1841,7 @@ def build_complete_hourly_grid(station_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def summarize_missingness(station_df: pd.DataFrame) -> List[Dict[str, object]]:
+    """Summarize missingness and gap-run structure by variable for one station."""
     rows: List[Dict[str, object]] = []
     if station_df.empty:
         return rows
@@ -1791,6 +1865,7 @@ def summarize_missingness(station_df: pd.DataFrame) -> List[Dict[str, object]]:
 
 
 def cast_output_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Cast output columns to stable dtypes for consistent downstream I/O."""
     out = df.copy()
     for var in CANONICAL_ORDER:
         out[var] = pd.to_numeric(out[var], errors="coerce").astype("Float32")
@@ -1800,6 +1875,7 @@ def cast_output_dtypes(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def assert_output_schema(df: pd.DataFrame) -> None:
+    """Validate final scrub schema and station-hour uniqueness contract."""
     required = ["station_raw", "station_slug", "source", "datetime_utc"] + CANONICAL_ORDER
     for var in CANONICAL_ORDER:
         required.append(f"{var}_failed_qc")
@@ -1813,6 +1889,7 @@ def assert_output_schema(df: pd.DataFrame) -> None:
 
 
 def manifest_signature(latest_inventory: pd.DataFrame) -> str:
+    """Create a deterministic signature of inputs used for this scrub run."""
     if latest_inventory.empty:
         return ""
     subset = latest_inventory[["source", "file_path", "sha256", "status"]].fillna("")
@@ -1831,6 +1908,7 @@ def append_scrub_run_manifest(
     obtain_signature: str,
     scrub_runs_manifest: Path,
 ) -> None:
+    """Append run-level metadata so outputs can be traced back to exact inputs."""
     station_ranges = (
         output_df.groupby("station_slug", dropna=False)["datetime_utc"].agg(["min", "max"]).reset_index()
     )
@@ -1875,6 +1953,7 @@ def run_scrub(
     logger: logging.Logger,
     dry_run: bool,
 ) -> Dict[str, object]:
+    """Execute parse -> normalize -> aggregate -> QC/fill -> write scrubbed artifacts."""
     if inventory.empty:
         raise ValueError("No usable input files found after obtain discovery.")
 
@@ -1886,6 +1965,7 @@ def run_scrub(
     precip_log_rows: List[Dict[str, object]] = []
 
     for _, manifest_row in inventory.iterrows():
+        # Parse each source file into a common schema before hourly aggregation.
         source = str(manifest_row.get("source", "")).strip().lower()
         file_path = Path(str(manifest_row.get("file_path", "")))
         if not file_path.exists():
@@ -1955,6 +2035,7 @@ def run_scrub(
     assert_output_schema(final_df)
 
     if not dry_run:
+        # Persist primary cleaned table plus quality diagnostics and run metadata.
         write_df = final_df.copy()
         write_df["datetime_utc"] = pd.to_datetime(write_df["datetime_utc"], utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         write_df.to_csv(output_hourly, index=False)
@@ -1984,7 +2065,12 @@ def run_scrub(
     }
 
 
+# -----------------------------------------------------------------------------
+# CLI wiring and business-facing run summary
+# -----------------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
+    """Define command-line options for running this standalone cleaning pipeline."""
     parser = argparse.ArgumentParser(
         description="Run combined obtain + scrub pipeline into scrubbed hourly outputs.",
     )
@@ -2004,6 +2090,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """Program entrypoint: run obtain + scrub stages and print a decision-oriented summary."""
     args = parse_args()
 
     raw_dir = args.raw_dir.resolve()
