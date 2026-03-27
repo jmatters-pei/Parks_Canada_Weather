@@ -1,10 +1,15 @@
-# Ignore data, outputs, and plan directories
-/data/
-/outputs/
-/plan/
+# Ignore everything by default.
+*
 
-# Ignore new plans directory
-/plans/
+# Keep this file tracked so rules remain in the repository.
+!.gitignore
 
-# Ignore Python virtual environment
-.venv/
+# Keep requested root files tracked.
+!README.md
+!requirements.txt
+!analysis.ipynb
+
+# Keep only cleaning.py under src tracked.
+!src/
+src/*
+!src/cleaning.py
