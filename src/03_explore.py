@@ -48,21 +48,6 @@ PAIRWISE_VARS = [
 HALIFAX_TZ = ZoneInfo("America/Halifax")
 MIN_PAIRWISE_OVERLAP_HOURS = 720
 
-MONTH_LABELS = {
-    1: "jan",
-    2: "feb",
-    3: "mar",
-    4: "apr",
-    5: "may",
-    6: "jun",
-    7: "jul",
-    8: "aug",
-    9: "sep",
-    10: "oct",
-    11: "nov",
-    12: "dec",
-}
-
 WEST_TO_EAST_STATIONS = [
     "Stanley_Bridge_Wharf",
     "Cavendish",
@@ -639,23 +624,6 @@ def _plot_corr_heatmap(matrix: pd.DataFrame, title: str, output_path: Path) -> N
     plt.close()
 
 
-def _plot_monthly_precip_corr_heatmaps(df: pd.DataFrame, output_dir: Path) -> List[Path]:
-    """Create one precipitation correlation heatmap per month pooled across years."""
-    outputs: List[Path] = []
-    for month in range(1, 13):
-        month_df = df[df["datetime_utc"].dt.month == month].copy()
-        matrix = _corr_matrix(month_df, CANONICAL_VARIABLES["rain"])
-        month_slug = MONTH_LABELS[month]
-        out_path = output_dir / f"03_explore_corr_precip_{month:02d}_{month_slug}.png"
-        _plot_corr_heatmap(
-            matrix,
-            f"Correlation Matrix: Precipitation ({month_slug.upper()} pooled across years)",
-            out_path,
-        )
-        outputs.append(out_path)
-    return outputs
-
-
 def write_csv(df: pd.DataFrame, path: Path) -> None:
     """Write DataFrame to CSV (empty frames still keep headers where possible)."""
     if df.empty:
@@ -716,7 +684,6 @@ def main() -> int:
         "Correlation Matrix: Precipitation",
         FIGURES_DIR / "03_explore_corr_precip.png",
     )
-    monthly_precip_corr_files = _plot_monthly_precip_corr_heatmaps(df, FIGURES_DIR)
 
     logger.info("Wrote table: %s", TABLES_DIR / "03_explore_coverage_overall.csv")
     logger.info("Wrote table: %s", TABLES_DIR / "03_explore_coverage_monthly.csv")
@@ -736,8 +703,6 @@ def main() -> int:
     logger.info("Wrote figure: %s", FIGURES_DIR / "03_explore_corr_rh.png")
     logger.info("Wrote figure: %s", FIGURES_DIR / "03_explore_corr_wind_speed.png")
     logger.info("Wrote figure: %s", FIGURES_DIR / "03_explore_corr_precip.png")
-    for file_path in monthly_precip_corr_files:
-        logger.info("Wrote figure: %s", file_path)
 
     logger.info(
         "Summary | rows=%s | stations=%s | summer_overlay_month=%s-%02d | pairwise_core_rows=%s",
