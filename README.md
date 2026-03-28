@@ -8,17 +8,15 @@ This project helps you:
 
 It is written to be runnable by non–data science users.
 
-## Quick Start (Windows)
+## Quick Start 
 
-Open PowerShell in the project folder, then run:
+Clone this repository onto your local computer. 
 
-```bash
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-pip install jupyter
-python src\cleaning.py
-```
+Place the raw HOBOlink data files into `data/raw/`
+
+In VSCode open 'cleaning.py' and run it.
+
+Note the first time you run cleaning.py it will take quite some time. Subsequent runs will take much less time. 
 
 Then open `analysis.ipynb` in VS Code and click **Run All**.
 
