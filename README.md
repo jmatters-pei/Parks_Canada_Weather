@@ -14,9 +14,9 @@ Clone this repository onto your local computer.
 
 Place the raw HOBOlink data files into `data/raw/`
 
-In VSCode open 'cleaning.py' and run it.
+In VSCode open `src/cleaning.py` and run it.
 
-Note the first time you run cleaning.py it will take quite some time. Subsequent runs will take much less time. 
+Note the first time you run `src/cleaning.py` it will take quite some time. Subsequent runs will take much less time. 
 
 Then open `analysis.ipynb` in VS Code and click **Run All**.
 
@@ -87,6 +87,8 @@ Run:
 ```bash
 python src/cleaning.py
 ```
+
+No command-line options are required or supported. The script runs one standard project workflow.
 
 What this does (high level):
 

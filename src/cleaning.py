@@ -13,9 +13,12 @@ from tempfile import NamedTemporaryFile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+
+HALIFAX_TZ = ZoneInfo("America/Halifax")
 
 # -----------------------------------------------------------------------------
 # Configuration constants
@@ -993,7 +996,7 @@ def parse_utc_datetime(utc_date_text: str) -> Optional[datetime]:
 
 
 def log_local_date_offset_diagnostics(records: List[Dict[str, object]], logger: logging.Logger) -> None:
-    """Report observed UTC-LOCAL offsets to validate LOCAL_DATE hour semantics."""
+    """Report LOCAL_DATE offsets relative to UTC_DATE converted in America/Halifax."""
     offset_hours: List[int] = []
     for feature in records:
         properties = feature.get("properties")
@@ -1003,7 +1006,8 @@ def log_local_date_offset_diagnostics(records: List[Dict[str, object]], logger: 
         utc_dt = parse_utc_datetime(properties.get("UTC_DATE", ""))
         if local_dt is None or utc_dt is None:
             continue
-        delta_seconds = (utc_dt.replace(tzinfo=None) - local_dt).total_seconds()
+        expected_local = utc_dt.astimezone(HALIFAX_TZ).replace(tzinfo=None)
+        delta_seconds = (local_dt - expected_local).total_seconds()
         offset_hours.append(int(round(delta_seconds / 3600.0)))
 
     if not offset_hours:
@@ -1012,11 +1016,14 @@ def log_local_date_offset_diagnostics(records: List[Dict[str, object]], logger: 
 
     distinct = sorted(set(offset_hours))
     if len(distinct) == 1:
-        logger.info("Observed stable UTC-LOCAL offset of %s hours; treating LOCAL_DATE as LST-aligned.", distinct[0])
+        logger.info(
+            "Observed stable LOCAL_DATE offset of %s hours relative to UTC_DATE in America/Halifax.",
+            distinct[0],
+        )
         return
 
     logger.warning(
-        "Observed multiple UTC-LOCAL offsets %s in LOCAL_DATE/UTC_DATE pairs; noon extraction currently uses LOCAL_DATE as provided.",
+        "Observed multiple LOCAL_DATE offsets %s relative to UTC_DATE in America/Halifax.",
         distinct,
     )
 
@@ -1055,23 +1062,41 @@ def extract_noon_weather_values(properties: Dict[str, object]) -> Optional[Tuple
 def extract_daily_fwi_inputs(
     records: List[Dict[str, object]],
 ) -> Tuple[Dict[str, Dict[str, object]], List[Dict[str, object]]]:
-    """Construct noon-based daily FWI inputs and audit metadata from hourly API records."""
-    by_dt: Dict[datetime, Dict[str, object]] = {}
+    """Construct noon-based daily FWI inputs using America/Halifax local-noon semantics."""
+    by_utc: Dict[datetime, Dict[str, object]] = {}
+    by_local_fallback: Dict[datetime, Dict[str, object]] = {}
     for feature in records:
         properties = feature.get("properties")
         if not isinstance(properties, dict):
             continue
-        dt = parse_local_datetime(properties.get("LOCAL_DATE", ""))
-        if dt is None:
+        utc_dt = parse_utc_datetime(properties.get("UTC_DATE", ""))
+        if utc_dt is not None:
+            by_utc[utc_dt] = properties
             continue
-        by_dt[dt] = properties
 
-    if not by_dt:
+        local_dt = parse_local_datetime(properties.get("LOCAL_DATE", ""))
+        if local_dt is not None:
+            by_local_fallback[local_dt] = properties
+
+    if not by_utc and not by_local_fallback:
         return {}, []
 
-    dates = sorted({stamp.date() for stamp in by_dt})
+    dates = sorted(
+        {
+            *(stamp.astimezone(HALIFAX_TZ).date() for stamp in by_utc),
+            *(stamp.date() for stamp in by_local_fallback),
+        }
+    )
     daily: Dict[str, Dict[str, object]] = {}
     noon_audit_rows: List[Dict[str, object]] = []
+
+    def get_record_for_local(local_stamp: datetime) -> Optional[Dict[str, object]]:
+        local_aware = local_stamp.replace(tzinfo=HALIFAX_TZ)
+        utc_stamp = local_aware.astimezone(timezone.utc)
+        record = by_utc.get(utc_stamp)
+        if record is not None:
+            return record
+        return by_local_fallback.get(local_stamp)
 
     for day in dates:
         noon_stamp = datetime(day.year, day.month, day.day, 12)
@@ -1079,7 +1104,7 @@ def extract_daily_fwi_inputs(
         noon_hour_used = ""
         noon_values: Optional[Tuple[float, float, float]] = None
 
-        observed_noon = by_dt.get(noon_stamp)
+        observed_noon = get_record_for_local(noon_stamp)
         if observed_noon is not None:
             observed_values = extract_noon_weather_values(observed_noon)
             if observed_values is not None:
@@ -1088,8 +1113,8 @@ def extract_daily_fwi_inputs(
                 noon_hour_used = "12"
 
         if noon_values is None:
-            hour11 = by_dt.get(noon_stamp - timedelta(hours=1))
-            hour13 = by_dt.get(noon_stamp + timedelta(hours=1))
+            hour11 = get_record_for_local(noon_stamp - timedelta(hours=1))
+            hour13 = get_record_for_local(noon_stamp + timedelta(hours=1))
             if hour11 is not None and hour13 is not None:
                 values11 = extract_noon_weather_values(hour11)
                 values13 = extract_noon_weather_values(hour13)
@@ -1115,9 +1140,14 @@ def extract_daily_fwi_inputs(
         temp_value, rh_value, wind_value = noon_values
 
         precip_total = 0.0
+        noon_local = noon_stamp.replace(tzinfo=HALIFAX_TZ)
+        start_utc = (noon_local - timedelta(hours=24)).astimezone(timezone.utc)
         for offset_hours in range(1, 25):
-            stamp = noon_stamp - timedelta(hours=24 - offset_hours)
-            hourly = by_dt.get(stamp)
+            stamp_utc = start_utc + timedelta(hours=offset_hours)
+            hourly = by_utc.get(stamp_utc)
+            if hourly is None:
+                stamp_local = (noon_stamp - timedelta(hours=24 - offset_hours))
+                hourly = by_local_fallback.get(stamp_local)
             if not hourly:
                 continue
             precip = hourly.get("PRECIP_AMOUNT")
@@ -1740,7 +1770,7 @@ def compute_stanhope_fwi_daily_file(
     end_date: date,
     destination: Path,
     logger: logging.Logger,
-    dynamic_spring_start: bool = False,
+    dynamic_spring_start: bool = True,
     spring_start_threshold_c: float = FWI_DYNAMIC_START_THRESHOLD_C,
     spring_start_consecutive_days: int = FWI_DYNAMIC_START_CONSECUTIVE_DAYS,
     spring_start_fallback: str = FWI_SPRING_START_FALLBACK,
@@ -1777,12 +1807,13 @@ def compute_stanhope_fwi_daily_file(
     if not daily_inputs:
         return STATUS_FAILED_READ, 0, "", "No complete daily noon inputs found to compute FWI.", None, None
 
-    effective_start = start_date
+    effective_start = date(year, FWI_SEASON_START_MONTH, FWI_SEASON_START_DAY)
     if dynamic_spring_start:
+        latest_start = date(year, FWI_SEASON_START_MONTH, FWI_SEASON_START_DAY)
         effective_start = determine_spring_start_date(
             daily_inputs,
             year=year,
-            fallback_date=start_date,
+            fallback_date=latest_start,
             logger=logger,
             threshold_c=spring_start_threshold_c,
             required_consecutive_days=spring_start_consecutive_days,
@@ -1939,7 +1970,7 @@ def download_eccc_fwi_daily_periods(
     end_date: date,
     logger: logging.Logger,
     dry_run: bool,
-    dynamic_spring_start: bool = False,
+    dynamic_spring_start: bool = True,
     spring_start_threshold_c: float = FWI_DYNAMIC_START_THRESHOLD_C,
     spring_start_consecutive_days: int = FWI_DYNAMIC_START_CONSECUTIVE_DAYS,
     spring_start_fallback: str = FWI_SPRING_START_FALLBACK,
@@ -3117,95 +3148,20 @@ def run_scrub(
 # -----------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    """Define command-line options for running this standalone cleaning pipeline."""
+    """Keep CLI intentionally simple: run with no options."""
     parser = argparse.ArgumentParser(
         description="Run combined obtain + scrub pipeline into scrubbed hourly outputs.",
-    )
-    parser.add_argument("--raw-dir", type=Path, default=RAW_DIR, help="Raw input directory root.")
-    parser.add_argument("--scrubbed-dir", type=Path, default=SCRUBBED_DIR, help="Scrubbed output directory.")
-    parser.add_argument("--outputs-dir", type=Path, default=OUTPUTS_DIR, help="Outputs directory for logs/tables/figures.")
-    parser.add_argument("--start-year", type=int, default=None, help="Start year for ECCC internet fetch window.")
-    parser.add_argument("--end-year", type=int, default=None, help="End year for ECCC internet fetch window.")
-    parser.add_argument(
-        "--skip-eccc-download",
-        action="store_true",
-        help="Skip ECCC internet fetch and use only files already present in data/raw/ECCC_Stanhope.",
-    )
-    parser.add_argument("--force", action="store_true", help="Overwrite existing outputs if present.")
-    parser.add_argument("--dry-run", action="store_true", help="Validate and summarize without writing files.")
-    parser.add_argument(
-        "--disable-wind-to-10m",
-        action="store_true",
-        help="Skip HOBOlink wind conversion to 10m equivalent and retain raw wind as canonical wind_speed_kmh.",
-    )
-    parser.add_argument(
-        "--fwi-dynamic-start",
-        action="store_true",
-        help="Enable dynamic spring startup date (3 consecutive observed noon days >= threshold).",
-    )
-    parser.add_argument(
-        "--fwi-spring-start-temp-c",
-        type=float,
-        default=FWI_DYNAMIC_START_THRESHOLD_C,
-        help="Noon temperature threshold in C used to detect dynamic spring startup.",
-    )
-    parser.add_argument(
-        "--fwi-spring-start-consecutive-days",
-        type=int,
-        default=FWI_DYNAMIC_START_CONSECUTIVE_DAYS,
-        help="Required count of consecutive observed noon days meeting spring startup threshold.",
-    )
-    parser.add_argument(
-        "--fwi-spring-fallback",
-        type=str,
-        choices=["june1", "first_observed"],
-        default=FWI_SPRING_START_FALLBACK,
-        help="Fallback strategy when dynamic spring criterion is not met.",
-    )
-    parser.add_argument(
-        "--fwi-enable-overwinter-dc",
-        action="store_true",
-        help="Enable parameterized overwinter DC carryover when observed startup seed is unavailable.",
-    )
-    parser.add_argument(
-        "--fwi-overwinter-drying-factor",
-        type=float,
-        default=None,
-        help="Overwinter DC drying factor parameter (must be explicitly set when overwinter DC is enabled).",
-    )
-    parser.add_argument(
-        "--fwi-overwinter-wetting-efficiency",
-        type=float,
-        default=None,
-        help="Overwinter DC wetting efficiency parameter (must be explicitly set when overwinter DC is enabled).",
-    )
-    parser.add_argument(
-        "--fwi-enable-overwinter-ffmc-dmc",
-        action="store_true",
-        help="Enable parameterized overwinter FFMC/DMC carryover when observed startup seed is unavailable.",
-    )
-    parser.add_argument(
-        "--fwi-overwinter-ffmc-decay",
-        type=float,
-        default=None,
-        help="Overwinter FFMC decay parameter (must be set when FFMC/DMC overwinter mode is enabled).",
-    )
-    parser.add_argument(
-        "--fwi-overwinter-dmc-decay",
-        type=float,
-        default=None,
-        help="Overwinter DMC decay parameter (must be set when FFMC/DMC overwinter mode is enabled).",
     )
     return parser.parse_args()
 
 
 def main() -> int:
     """Program entrypoint: run obtain + scrub stages and print a decision-oriented summary."""
-    args = parse_args()
+    parse_args()
 
-    raw_dir = args.raw_dir.resolve()
-    scrubbed_dir = args.scrubbed_dir.resolve()
-    outputs_dir = args.outputs_dir.resolve()
+    raw_dir = RAW_DIR.resolve()
+    scrubbed_dir = SCRUBBED_DIR.resolve()
+    outputs_dir = OUTPUTS_DIR.resolve()
     manifest_dir = scrubbed_dir / "_manifests"
 
     output_hourly = scrubbed_dir / OUTPUT_HOURLY.name
@@ -3219,44 +3175,27 @@ def main() -> int:
     log_path = outputs_dir / "logs" / f"cleaning_{datetime.now(timezone.utc):%Y%m%d}.log"
     logger = setup_logging(log_path)
 
-    if args.force:
-        logger.info("--force provided; existing scrubbed outputs will be overwritten.")
-    elif not args.dry_run:
-        logger.info("Overwrite mode is default; existing scrubbed outputs/manifests will be replaced.")
+    logger.info("Running standard mode with fixed settings (no CLI options).")
 
     logger.info("Step A (obtain): discovering local files and building manifests.")
-    if args.fwi_enable_overwinter_dc and (
-        args.fwi_overwinter_drying_factor is None or args.fwi_overwinter_wetting_efficiency is None
-    ):
-        raise ValueError(
-            "--fwi-enable-overwinter-dc requires both --fwi-overwinter-drying-factor and "
-            "--fwi-overwinter-wetting-efficiency to be set."
-        )
-    if args.fwi_enable_overwinter_ffmc_dmc and (
-        args.fwi_overwinter_ffmc_decay is None or args.fwi_overwinter_dmc_decay is None
-    ):
-        raise ValueError(
-            "--fwi-enable-overwinter-ffmc-dmc requires both --fwi-overwinter-ffmc-decay and "
-            "--fwi-overwinter-dmc-decay to be set."
-        )
     inventory = run_obtain(
         raw_dir=raw_dir,
         manifest_dir=manifest_dir,
         logger=logger,
-        dry_run=args.dry_run,
-        start_year=args.start_year,
-        end_year=args.end_year,
-        skip_eccc_download=args.skip_eccc_download,
-        fwi_dynamic_start=args.fwi_dynamic_start,
-        fwi_spring_start_temp_c=args.fwi_spring_start_temp_c,
-        fwi_spring_start_consecutive_days=args.fwi_spring_start_consecutive_days,
-        fwi_spring_fallback=args.fwi_spring_fallback,
-        fwi_enable_overwinter_dc=args.fwi_enable_overwinter_dc,
-        fwi_overwinter_drying_factor=args.fwi_overwinter_drying_factor,
-        fwi_overwinter_wetting_efficiency=args.fwi_overwinter_wetting_efficiency,
-        fwi_enable_overwinter_ffmc_dmc=args.fwi_enable_overwinter_ffmc_dmc,
-        fwi_overwinter_ffmc_decay=args.fwi_overwinter_ffmc_decay,
-        fwi_overwinter_dmc_decay=args.fwi_overwinter_dmc_decay,
+        dry_run=False,
+        start_year=None,
+        end_year=None,
+        skip_eccc_download=False,
+        fwi_dynamic_start=True,
+        fwi_spring_start_temp_c=FWI_DYNAMIC_START_THRESHOLD_C,
+        fwi_spring_start_consecutive_days=FWI_DYNAMIC_START_CONSECUTIVE_DAYS,
+        fwi_spring_fallback=FWI_SPRING_START_FALLBACK,
+        fwi_enable_overwinter_dc=False,
+        fwi_overwinter_drying_factor=None,
+        fwi_overwinter_wetting_efficiency=None,
+        fwi_enable_overwinter_ffmc_dmc=False,
+        fwi_overwinter_ffmc_decay=None,
+        fwi_overwinter_dmc_decay=None,
     )
 
     logger.info("Step B (scrub): parsing, UTC normalization, QC, fill<=2h, hourly aggregation.")
@@ -3268,8 +3207,8 @@ def main() -> int:
         output_precip_log=output_precip_log,
         scrub_runs_manifest=scrub_runs_manifest,
         logger=logger,
-        dry_run=args.dry_run,
-        apply_wind_to_10m=not args.disable_wind_to_10m,
+        dry_run=False,
+        apply_wind_to_10m=True,
     )
 
     date_min = summary["date_min"]
@@ -3282,20 +3221,17 @@ def main() -> int:
         summary.get("wind_10m_adjusted_stations", 0),
         summary.get("wind_10m_consistency_violations", 0),
     )
-    if args.dry_run:
-        logger.info("Dry run mode enabled: no files were written.")
-    else:
-        logger.info("Wrote hourly: %s", output_hourly)
-        logger.info("Wrote missingness: %s", output_missingness)
-        logger.info("Wrote QC counts: %s", output_qc_counts)
-        logger.info("Wrote precip log: %s", output_precip_log)
-        logger.info("Wrote wind conversion provenance log: %s", OUTPUT_WIND_10M_LOG)
-        write_fwi_validation_by_noon_source(
-            station_daily_path=MODEL_FWI_DAILY_TABLE,
-            observed_daily_dir=ECCC_FWI_CACHE_DIR,
-            destination=MODEL_FWI_VALIDATION_BY_NOON_TABLE,
-            logger=logger,
-        )
+    logger.info("Wrote hourly: %s", output_hourly)
+    logger.info("Wrote missingness: %s", output_missingness)
+    logger.info("Wrote QC counts: %s", output_qc_counts)
+    logger.info("Wrote precip log: %s", output_precip_log)
+    logger.info("Wrote wind conversion provenance log: %s", OUTPUT_WIND_10M_LOG)
+    write_fwi_validation_by_noon_source(
+        station_daily_path=MODEL_FWI_DAILY_TABLE,
+        observed_daily_dir=ECCC_FWI_CACHE_DIR,
+        destination=MODEL_FWI_VALIDATION_BY_NOON_TABLE,
+        logger=logger,
+    )
 
     variable_labels = {
         "air_temperature_c": "Air temperature",
@@ -3348,16 +3284,12 @@ def main() -> int:
             f"{variable_labels.get(worst_var, worst_var)} ({worst_missing:.2f}% missing)."
         )
 
-    if args.dry_run:
-        print("\nMode: dry-run (no files written)")
-        print("This run is suitable for pre-flight validation before generating deliverables.")
-    else:
-        print("\nArtifacts written:")
-        print(f"  - Hourly weather: {output_hourly}")
-        print(f"  - Missingness summary: {output_missingness}")
-        print(f"  - QC out-of-range counts: {output_qc_counts}")
-        print(f"  - Precip semantics log: {output_precip_log}")
-        print("\nNext business step: run analysis.ipynb to produce decision-ready station redundancy and FWI risk outputs.")
+    print("\nArtifacts written:")
+    print(f"  - Hourly weather: {output_hourly}")
+    print(f"  - Missingness summary: {output_missingness}")
+    print(f"  - QC out-of-range counts: {output_qc_counts}")
+    print(f"  - Precip semantics log: {output_precip_log}")
+    print("\nNext business step: run analysis.ipynb to produce decision-ready station redundancy and FWI risk outputs.")
 
     return 0
 
