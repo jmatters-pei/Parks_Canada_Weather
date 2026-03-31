@@ -73,10 +73,13 @@ MANIFEST_COLUMNS = [
     "file_path",
     "size_bytes",
     "sha256",
+    "file_mtime_ns",
     "ingested_at_utc",
     "status",
     "error_message",
     "schema_hash",
+    "coverage_start_date",
+    "coverage_end_date",
 ]
 
 SCHEMA_COLUMNS = [
@@ -119,6 +122,8 @@ FWI_SEASON_END_DAY = 30
 FFMC_START = 85.0
 DMC_START = 6.0
 DC_START = 15.0
+FWI_CONTINUOUS_INTERPOLATION_LIMIT_DAYS = 2
+FWI_PRECIP_ZERO_FILL_MAX_GAP_DAYS = 2
 
 TEMP_BOUNDS = (-50.0, 50.0)
 RH_MIN = 0.0
@@ -562,9 +567,12 @@ def create_manifest_row(
     file_path: Path,
     size_bytes: int,
     sha256_value: str,
+    file_mtime_ns: Optional[int] = None,
     status: str,
     error_message: Optional[str],
     schema_hash: Optional[str],
+    coverage_start_date: Optional[str] = None,
+    coverage_end_date: Optional[str] = None,
 ) -> Dict[str, object]:
     """Build one standard manifest record used by obtain/scrub lineage tracking."""
     return {
@@ -577,10 +585,13 @@ def create_manifest_row(
         "file_path": str(file_path),
         "size_bytes": size_bytes,
         "sha256": sha256_value,
+        "file_mtime_ns": int(file_mtime_ns) if file_mtime_ns is not None else pd.NA,
         "ingested_at_utc": utc_now_iso(),
         "status": status,
         "error_message": error_message,
         "schema_hash": schema_hash,
+        "coverage_start_date": coverage_start_date,
+        "coverage_end_date": coverage_end_date,
     }
 
 
@@ -664,6 +675,32 @@ def derive_hobolink_coverage_bounds(
     hobolink_rows: List[Dict[str, object]], logger: logging.Logger
 ) -> Optional[Tuple[date, date]]:
     """Estimate global HOBOlink start/end dates across all usable files."""
+    cached_starts: List[date] = []
+    cached_ends: List[date] = []
+    for row in hobolink_rows:
+        if not status_is_usable(row.get("status")):
+            continue
+        start_text = str(row.get("coverage_start_date", "")).strip()
+        end_text = str(row.get("coverage_end_date", "")).strip()
+        if not start_text or not end_text:
+            continue
+        try:
+            cached_starts.append(date.fromisoformat(start_text))
+            cached_ends.append(date.fromisoformat(end_text))
+        except ValueError:
+            continue
+
+    if cached_starts and cached_ends:
+        min_seen = min(cached_starts)
+        max_seen = max(cached_ends)
+        logger.info(
+            "HOBOlink coverage bounds derived from manifest cache (%s files): %s to %s",
+            len(cached_starts),
+            min_seen,
+            max_seen,
+        )
+        return min_seen, max_seen
+
     min_seen: Optional[date] = None
     max_seen: Optional[date] = None
     scanned_files = 0
@@ -990,20 +1027,111 @@ def extract_daily_fwi_inputs(records: List[Dict[str, object]]) -> Dict[str, Dict
     return daily
 
 
-def compute_fwi_daily_records(daily_inputs: Dict[str, Dict[str, float]]) -> List[Dict[str, object]]:
-    """Run sequential daily FWI calculations over a season (stateful moisture codes)."""
+def build_fwi_daily_driver_table(
+    daily_inputs: Dict[str, Dict[str, float]],
+    *,
+    start_date: date,
+    end_date: date,
+) -> pd.DataFrame:
+    """Build a continuous daily FWI driver table with bounded imputations and flags."""
+    full_index = pd.date_range(start=start_date, end=end_date, freq="D")
+    base = pd.DataFrame({"date": full_index})
+
+    if daily_inputs:
+        observed_rows = []
+        for date_text, values in daily_inputs.items():
+            observed_rows.append(
+                {
+                    "date": pd.Timestamp(date.fromisoformat(date_text)),
+                    "t": float(values["t"]),
+                    "h": float(values["h"]),
+                    "w": float(values["w"]),
+                    "p": float(values["p"]),
+                }
+            )
+        observed_df = pd.DataFrame(observed_rows)
+    else:
+        observed_df = pd.DataFrame(columns=["date", "t", "h", "w", "p"])
+
+    driver = base.merge(observed_df, on="date", how="left")
+
+    for variable in ("t", "h", "w", "p"):
+        driver[f"{variable}_observed"] = driver[variable].notna()
+
+    # Fill only short interior gaps to preserve long-outage visibility.
+    for variable in ("t", "h", "w"):
+        driver[variable] = pd.to_numeric(driver[variable], errors="coerce").interpolate(
+            method="linear",
+            limit=FWI_CONTINUOUS_INTERPOLATION_LIMIT_DAYS,
+            limit_area="inside",
+        )
+
+    precip_missing_before = driver["p"].isna()
+    precip_fill_mask = short_gap_mask(driver["p"], max_gap=FWI_PRECIP_ZERO_FILL_MAX_GAP_DAYS) & precip_missing_before
+    driver.loc[precip_fill_mask, "p"] = 0.0
+
+    linear_imputed = pd.Series(False, index=driver.index, dtype="boolean")
+    for variable in ("t", "h", "w"):
+        linear_imputed = linear_imputed | (~driver[f"{variable}_observed"] & driver[variable].notna())
+    driver["imputed_day"] = (linear_imputed | precip_fill_mask).astype("boolean")
+
+    driver["imputation_method"] = "none"
+    driver.loc[linear_imputed, "imputation_method"] = "linear"
+    driver.loc[precip_fill_mask, "imputation_method"] = "zero_fill"
+    driver.loc[linear_imputed & precip_fill_mask, "imputation_method"] = "linear+zero_fill"
+
+    driver["unresolved_gap"] = driver[["t", "h", "w", "p"]].isna().any(axis=1)
+    driver.loc[driver["unresolved_gap"], "imputation_method"] = "unresolved_gap"
+
+    return driver
+
+
+def compute_fwi_daily_records(
+    daily_inputs: Dict[str, Dict[str, float]],
+    *,
+    start_date: date,
+    end_date: date,
+) -> List[Dict[str, object]]:
+    """Run sequential daily FWI calculations over a continuous daily driver timeline."""
     ffmc_value = FFMC_START
     dmc_value = DMC_START
     dc_value = DC_START
     results: List[Dict[str, object]] = []
+    driver = build_fwi_daily_driver_table(daily_inputs, start_date=start_date, end_date=end_date)
+    season_invalid = False
 
-    for date_text in sorted(daily_inputs.keys()):
-        current_day = date.fromisoformat(date_text)
+    for _, row in driver.iterrows():
+        current_day = row["date"].date()
+        date_text = current_day.isoformat()
         season_end = date(current_day.year, FWI_SEASON_END_MONTH, FWI_SEASON_END_DAY)
         if current_day > season_end:
             continue
 
-        values = daily_inputs[date_text]
+        if bool(row["unresolved_gap"]):
+            season_invalid = True
+
+        if season_invalid:
+            results.append(
+                {
+                    "Date": date_text,
+                    "T_noon": round(float(row["t"]), 1) if pd.notna(row["t"]) else pd.NA,
+                    "RH_noon": round(float(row["h"]), 0) if pd.notna(row["h"]) else pd.NA,
+                    "Wind_noon": round(float(row["w"]), 0) if pd.notna(row["w"]) else pd.NA,
+                    "Precip_24h": round(float(row["p"]), 1) if pd.notna(row["p"]) else pd.NA,
+                    "FFMC": pd.NA,
+                    "DMC": pd.NA,
+                    "DC": pd.NA,
+                    "ISI": pd.NA,
+                    "BUI": pd.NA,
+                    "FWI": pd.NA,
+                    "fwi_valid": False,
+                    "imputed_day": bool(row["imputed_day"]),
+                    "imputation_method": str(row["imputation_method"]),
+                }
+            )
+            continue
+
+        values = {"t": float(row["t"]), "h": float(row["h"]), "w": float(row["w"]), "p": float(row["p"])}
         month = int(date_text[5:7])
 
         ffmc_value = ffmc_code(values["t"], values["h"], values["w"], values["p"], ffmc_value)
@@ -1027,6 +1155,9 @@ def compute_fwi_daily_records(daily_inputs: Dict[str, Dict[str, float]]) -> List
                 "ISI": round(isi_value, 2),
                 "BUI": round(bui_value, 2),
                 "FWI": round(fwi_value, 2),
+                "fwi_valid": True,
+                "imputed_day": bool(row["imputed_day"]),
+                "imputation_method": str(row["imputation_method"]),
             }
         )
 
@@ -1079,7 +1210,11 @@ def compute_stanhope_fwi_daily_file(
     if not daily_inputs:
         return STATUS_FAILED_READ, 0, "", "No complete daily noon inputs found to compute FWI.", None, None
 
-    results = compute_fwi_daily_records(daily_inputs)
+    results = compute_fwi_daily_records(
+        daily_inputs,
+        start_date=start_date,
+        end_date=end_date,
+    )
     if not results:
         return STATUS_FAILED_READ, 0, "", "FWI computation produced no records.", None, None
 
@@ -1150,7 +1285,9 @@ def download_eccc_fwi_daily_periods(
                 recompute_existing = True
             else:
                 first_date, last_date = bounds
-                if first_date.month < FWI_SEASON_START_MONTH or last_date > season_end:
+                # We need to recompute if the file starts too late, or if it doesn't
+                # extend far enough to cover the known year_end requirement.
+                if first_date.month > FWI_SEASON_START_MONTH or last_date < year_end:
                     recompute_existing = True
 
         if destination.exists() and not recompute_existing:
@@ -1267,6 +1404,21 @@ def run_obtain(
     manifest_dir.mkdir(parents=True, exist_ok=True)
     schema_records: List[Dict[str, object]] = []
 
+    existing_hobolink_cache: Dict[str, Dict[str, object]] = {}
+    if HOBOLINK_MANIFEST.exists():
+        try:
+            existing_hobolink_manifest = pd.read_csv(HOBOLINK_MANIFEST)
+            if not existing_hobolink_manifest.empty:
+                existing_hobolink_manifest = existing_hobolink_manifest[
+                    existing_hobolink_manifest["source"].astype(str).str.lower() == "hobolink"
+                ].copy()
+                for _, cached_row in existing_hobolink_manifest.iterrows():
+                    file_path_text = str(cached_row.get("file_path", "")).strip()
+                    if file_path_text:
+                        existing_hobolink_cache[file_path_text] = cached_row.to_dict()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Unable to load existing HOBOlink manifest cache: %s", exc)
+
     hobolink_rows: List[Dict[str, object]] = []
     hobolink_years: List[int] = []
     for station in HOBOLINK_STATIONS:
@@ -1276,12 +1428,62 @@ def run_obtain(
             logger.warning("Missing HOBOlink drop-zone: %s", station_dir)
             continue
         for csv_path in sorted(station_dir.rglob("*.csv")):
-            size_bytes = csv_path.stat().st_size
+            stat_result = csv_path.stat()
+            size_bytes = stat_result.st_size
+            file_mtime_ns = int(stat_result.st_mtime_ns)
             year = extract_year(csv_path.name) or extract_year(str(csv_path.parent))
             if year is not None:
                 hobolink_years.append(year)
             period = str(year) if year is not None else "unknown"
-            schema_status, err, schema_hash, cols = inspect_csv_schema(csv_path, "hobolink")
+
+            schema_status: str
+            err: Optional[str]
+            schema_hash: Optional[str]
+            cols: Optional[List[str]]
+            sha256_value: str
+            coverage_start_date: Optional[str] = None
+            coverage_end_date: Optional[str] = None
+
+            cache_hit = False
+            cached = existing_hobolink_cache.get(str(csv_path))
+            if cached is not None:
+                cached_size_raw = cached.get("size_bytes")
+                cached_mtime_raw = cached.get("file_mtime_ns")
+                cached_sha = str(cached.get("sha256", "")).strip()
+                try:
+                    cached_size = int(float(cached_size_raw))
+                except Exception:  # noqa: BLE001
+                    cached_size = None
+                try:
+                    cached_mtime = int(float(cached_mtime_raw))
+                except Exception:  # noqa: BLE001
+                    cached_mtime = None
+
+                if cached_size == size_bytes and cached_mtime == file_mtime_ns and cached_sha:
+                    cache_hit = True
+                    sha256_value = cached_sha
+                    schema_status = str(cached.get("status", STATUS_OK)).strip() or STATUS_OK
+                    err_text = str(cached.get("error_message", "")).strip()
+                    err = err_text or None
+                    schema_hash_text = str(cached.get("schema_hash", "")).strip()
+                    schema_hash = schema_hash_text or None
+                    coverage_start_text = str(cached.get("coverage_start_date", "")).strip()
+                    coverage_end_text = str(cached.get("coverage_end_date", "")).strip()
+                    coverage_start_date = coverage_start_text or None
+                    coverage_end_date = coverage_end_text or None
+                    cols = None
+
+            if not cache_hit:
+                schema_status, err, schema_hash, cols = inspect_csv_schema(csv_path, "hobolink")
+                sha256_value = compute_sha256(csv_path)
+                try:
+                    bounds = read_hobolink_datetime_bounds(csv_path)
+                    if bounds is not None:
+                        coverage_start_date = bounds[0].isoformat()
+                        coverage_end_date = bounds[1].isoformat()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Skipping HOBOlink bounds parse failure for %s: %s", csv_path, exc)
+
             row = create_manifest_row(
                 source="hobolink",
                 station_raw=station,
@@ -1289,10 +1491,13 @@ def run_obtain(
                 period=period,
                 file_path=csv_path,
                 size_bytes=size_bytes,
-                sha256_value=compute_sha256(csv_path),
+                sha256_value=sha256_value,
+                file_mtime_ns=file_mtime_ns,
                 status=schema_status,
                 error_message=err,
                 schema_hash=schema_hash,
+                coverage_start_date=coverage_start_date,
+                coverage_end_date=coverage_end_date,
             )
             hobolink_rows.append(row)
             if schema_hash and cols:
