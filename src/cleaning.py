@@ -127,6 +127,8 @@ FWI_DYNAMIC_START_CONSECUTIVE_DAYS = 3
 FWI_SPRING_START_FALLBACK = "june1"
 FWI_CONTINUOUS_INTERPOLATION_LIMIT_DAYS = 2
 FWI_PRECIP_ZERO_FILL_MAX_GAP_DAYS = 2
+MODEL_FWI_DAILY_TABLE = TABLES_DIR / "04_model_fwi_daily.csv"
+MODEL_FWI_VALIDATION_BY_NOON_TABLE = TABLES_DIR / "04_model_fwi_validation_by_noon_source_imputation.csv"
 
 TEMP_BOUNDS = (-50.0, 50.0)
 RH_MIN = 0.0
@@ -968,8 +970,85 @@ def parse_local_datetime(local_date_text: str) -> Optional[datetime]:
     return None
 
 
-def extract_daily_fwi_inputs(records: List[Dict[str, object]]) -> Dict[str, Dict[str, float]]:
-    """Construct noon-based daily FWI inputs from hourly API records."""
+def parse_utc_datetime(utc_date_text: str) -> Optional[datetime]:
+    """Parse UTC_DATE text from API payloads into timezone-aware UTC datetime."""
+    text = str(utc_date_text).strip()
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def log_local_date_offset_diagnostics(records: List[Dict[str, object]], logger: logging.Logger) -> None:
+    """Report observed UTC-LOCAL offsets to validate LOCAL_DATE hour semantics."""
+    offset_hours: List[int] = []
+    for feature in records:
+        properties = feature.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        local_dt = parse_local_datetime(properties.get("LOCAL_DATE", ""))
+        utc_dt = parse_utc_datetime(properties.get("UTC_DATE", ""))
+        if local_dt is None or utc_dt is None:
+            continue
+        delta_seconds = (utc_dt.replace(tzinfo=None) - local_dt).total_seconds()
+        offset_hours.append(int(round(delta_seconds / 3600.0)))
+
+    if not offset_hours:
+        logger.warning("Unable to evaluate LOCAL_DATE offset semantics (missing LOCAL_DATE/UTC_DATE pairs).")
+        return
+
+    distinct = sorted(set(offset_hours))
+    if len(distinct) == 1:
+        logger.info("Observed stable UTC-LOCAL offset of %s hours; treating LOCAL_DATE as LST-aligned.", distinct[0])
+        return
+
+    logger.warning(
+        "Observed multiple UTC-LOCAL offsets %s in LOCAL_DATE/UTC_DATE pairs; noon extraction currently uses LOCAL_DATE as provided.",
+        distinct,
+    )
+
+
+def extract_noon_weather_values(properties: Dict[str, object]) -> Optional[Tuple[float, float, float]]:
+    """Extract noon weather inputs (temp, RH, wind), deriving RH from dew point when needed."""
+    temp = properties.get("TEMP")
+    wind = properties.get("WIND_SPEED")
+    rh = properties.get("RELATIVE_HUMIDITY")
+    dew_point = properties.get("DEW_POINT_TEMP")
+
+    if temp is None or wind is None:
+        return None
+
+    try:
+        temp_value = float(temp)
+        wind_value = float(wind)
+    except (TypeError, ValueError):
+        return None
+
+    if rh is None and dew_point is not None:
+        try:
+            rh = rh_from_dewpoint(temp_value, float(dew_point))
+        except (TypeError, ValueError):
+            rh = None
+    if rh is None:
+        return None
+
+    try:
+        rh_value = max(1.0, min(100.0, float(rh)))
+    except (TypeError, ValueError):
+        return None
+    return temp_value, rh_value, wind_value
+
+
+def extract_daily_fwi_inputs(
+    records: List[Dict[str, object]],
+) -> Tuple[Dict[str, Dict[str, object]], List[Dict[str, object]]]:
+    """Construct noon-based daily FWI inputs and audit metadata from hourly API records."""
     by_dt: Dict[datetime, Dict[str, object]] = {}
     for feature in records:
         properties = feature.get("properties")
@@ -981,40 +1060,54 @@ def extract_daily_fwi_inputs(records: List[Dict[str, object]]) -> Dict[str, Dict
         by_dt[dt] = properties
 
     if not by_dt:
-        return {}
+        return {}, []
 
     dates = sorted({stamp.date() for stamp in by_dt})
-    daily: Dict[str, Dict[str, float]] = {}
+    daily: Dict[str, Dict[str, object]] = {}
+    noon_audit_rows: List[Dict[str, object]] = []
 
     for day in dates:
-        noon_properties: Optional[Dict[str, object]] = None
-        for hour in (12, 11, 13):
-            # Prefer strict noon, but accept +/- 1 hour fallback if noon is missing.
-            candidate = datetime(day.year, day.month, day.day, hour)
-            if candidate in by_dt:
-                noon_properties = by_dt[candidate]
-                break
-        if noon_properties is None:
+        noon_stamp = datetime(day.year, day.month, day.day, 12)
+        noon_source = "missing_noon"
+        noon_hour_used = ""
+        noon_values: Optional[Tuple[float, float, float]] = None
+
+        observed_noon = by_dt.get(noon_stamp)
+        if observed_noon is not None:
+            observed_values = extract_noon_weather_values(observed_noon)
+            if observed_values is not None:
+                noon_values = observed_values
+                noon_source = "observed_12"
+                noon_hour_used = "12"
+
+        if noon_values is None:
+            hour11 = by_dt.get(noon_stamp - timedelta(hours=1))
+            hour13 = by_dt.get(noon_stamp + timedelta(hours=1))
+            if hour11 is not None and hour13 is not None:
+                values11 = extract_noon_weather_values(hour11)
+                values13 = extract_noon_weather_values(hour13)
+                if values11 is not None and values13 is not None:
+                    noon_values = (
+                        (values11[0] + values13[0]) / 2.0,
+                        (values11[1] + values13[1]) / 2.0,
+                        (values11[2] + values13[2]) / 2.0,
+                    )
+                    noon_source = "interp_11_13"
+                    noon_hour_used = "11_13"
+
+        if noon_values is None:
+            noon_audit_rows.append(
+                {
+                    "date": str(day),
+                    "noon_source": noon_source,
+                    "noon_hour_used": noon_hour_used,
+                }
+            )
             continue
 
-        temp = noon_properties.get("TEMP")
-        wind = noon_properties.get("WIND_SPEED")
-        rh = noon_properties.get("RELATIVE_HUMIDITY")
-        dew_point = noon_properties.get("DEW_POINT_TEMP")
-
-        if temp is None or wind is None:
-            continue
-        if rh is None and dew_point is not None:
-            rh = rh_from_dewpoint(float(temp), float(dew_point))
-        if rh is None:
-            continue
-
-        temp_value = float(temp)
-        rh_value = max(1.0, min(100.0, float(rh)))
-        wind_value = float(wind)
+        temp_value, rh_value, wind_value = noon_values
 
         precip_total = 0.0
-        noon_stamp = datetime(day.year, day.month, day.day, 12)
         for offset_hours in range(1, 25):
             stamp = noon_stamp - timedelta(hours=24 - offset_hours)
             hourly = by_dt.get(stamp)
@@ -1025,13 +1118,194 @@ def extract_daily_fwi_inputs(records: List[Dict[str, object]]) -> Dict[str, Dict
                 continue
             precip_total += float(precip)
 
-        daily[str(day)] = {"t": temp_value, "h": rh_value, "w": wind_value, "p": precip_total}
+        daily[str(day)] = {
+            "t": temp_value,
+            "h": rh_value,
+            "w": wind_value,
+            "p": precip_total,
+            "noon_source": noon_source,
+            "noon_hour_used": noon_hour_used,
+        }
+        noon_audit_rows.append(
+            {
+                "date": str(day),
+                "noon_source": noon_source,
+                "noon_hour_used": noon_hour_used,
+            }
+        )
 
-    return daily
+    return daily, noon_audit_rows
+
+
+def write_noon_source_yearly_summary(
+    *,
+    station_name: str,
+    year: int,
+    noon_audit_rows: List[Dict[str, object]],
+    destination: Path,
+) -> None:
+    """Upsert yearly noon-source counts used to construct daily FWI inputs."""
+    summary_columns = ["station_name", "year", "noon_source", "days_count", "updated_at_utc"]
+    if noon_audit_rows:
+        source_frame = pd.DataFrame(noon_audit_rows)
+        if "noon_source" in source_frame.columns and not source_frame.empty:
+            counts = (
+                source_frame.groupby("noon_source", dropna=False)
+                .size()
+                .reset_index(name="days_count")
+            )
+        else:
+            counts = pd.DataFrame(columns=["noon_source", "days_count"])
+    else:
+        counts = pd.DataFrame(columns=["noon_source", "days_count"])
+
+    if counts.empty:
+        counts = pd.DataFrame({"noon_source": ["missing_noon"], "days_count": [0]})
+
+    counts["station_name"] = station_name
+    counts["year"] = int(year)
+    counts["updated_at_utc"] = utc_now_iso()
+    counts = counts[["station_name", "year", "noon_source", "days_count", "updated_at_utc"]]
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        existing = pd.read_csv(destination)
+        for column in summary_columns:
+            if column not in existing.columns:
+                existing[column] = pd.NA
+        existing = existing[summary_columns]
+        existing = existing.loc[
+            ~(
+                existing["station_name"].astype(str).eq(station_name)
+                & pd.to_numeric(existing["year"], errors="coerce").eq(int(year))
+            )
+        ]
+        merged = pd.concat([existing, counts], ignore_index=True)
+    else:
+        merged = counts
+
+    merged.to_csv(destination, index=False)
+
+
+def write_fwi_validation_by_noon_source(
+    *,
+    station_daily_path: Path,
+    observed_daily_dir: Path,
+    destination: Path,
+    logger: logging.Logger,
+) -> bool:
+    """Write FWI validation metrics stratified by noon_source and imputation_method.
+
+    Returns True when a summary file is written, otherwise False when skipped due
+    to missing/insufficient inputs.
+    """
+    if not station_daily_path.exists():
+        logger.warning(
+            "Skipping noon-source validation summary: station daily table not found at %s",
+            station_daily_path,
+        )
+        return False
+
+    try:
+        station = pd.read_csv(station_daily_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Skipping noon-source validation summary: unable to read %s (%s)", station_daily_path, exc)
+        return False
+
+    required_station_columns = {"station_slug", "date_local", "fwi"}
+    if not required_station_columns.issubset(set(station.columns)):
+        logger.warning(
+            "Skipping noon-source validation summary: missing required station columns in %s",
+            station_daily_path,
+        )
+        return False
+
+    station["date"] = pd.to_datetime(station["date_local"], errors="coerce").dt.date
+    station["fwi_station"] = pd.to_numeric(station["fwi"], errors="coerce")
+    station = station[["station_slug", "date", "fwi_station"]].dropna(subset=["date"])
+
+    observed_frames: List[pd.DataFrame] = []
+    for csv_path in sorted(observed_daily_dir.glob("ECCC_Stanhope_*_daily_fwi.csv")):
+        try:
+            observed = pd.read_csv(csv_path)
+        except Exception:  # noqa: BLE001
+            continue
+
+        if "Date" not in observed.columns or "FWI" not in observed.columns:
+            continue
+
+        observed["date"] = pd.to_datetime(observed["Date"], errors="coerce").dt.date
+        observed["fwi_ref"] = pd.to_numeric(observed["FWI"], errors="coerce")
+        observed["noon_source"] = (
+            observed["noon_source"].astype(str)
+            if "noon_source" in observed.columns
+            else "observed_12"
+        )
+        observed["imputation_method"] = (
+            observed["imputation_method"].astype(str)
+            if "imputation_method" in observed.columns
+            else "none"
+        )
+        observed_frames.append(observed[["date", "fwi_ref", "noon_source", "imputation_method"]])
+
+    if not observed_frames:
+        logger.warning(
+            "Skipping noon-source validation summary: no observed Stanhope daily FWI files found in %s",
+            observed_daily_dir,
+        )
+        return False
+
+    observed_all = pd.concat(observed_frames, ignore_index=True).drop_duplicates(subset=["date"], keep="last")
+    merged = station.merge(observed_all, on="date", how="inner")
+    merged = merged.dropna(subset=["fwi_station", "fwi_ref"])
+    if merged.empty:
+        logger.warning("Skipping noon-source validation summary: no aligned station/reference rows after merge.")
+        return False
+
+    merged["error"] = merged["fwi_station"] - merged["fwi_ref"]
+    merged["abs_error"] = merged["error"].abs()
+    merged["sq_error"] = merged["error"] * merged["error"]
+
+    def summarize_metrics(group: pd.DataFrame) -> pd.Series:
+        n = int(len(group))
+        pearson_r = float("nan")
+        if n >= 2:
+            corr_val = group["fwi_station"].corr(group["fwi_ref"])
+            if pd.notna(corr_val):
+                pearson_r = float(corr_val)
+        return pd.Series(
+            {
+                "n": n,
+                "mae": float(group["abs_error"].mean()),
+                "rmse": math.sqrt(float(group["sq_error"].mean())),
+                "bias": float(group["error"].mean()),
+                "pearson_r": pearson_r,
+            }
+        )
+
+    by_station = (
+        merged.groupby(["station_slug", "noon_source", "imputation_method"], dropna=False)
+        .apply(summarize_metrics)
+        .reset_index()
+    )
+    overall = (
+        merged.groupby(["noon_source", "imputation_method"], dropna=False)
+        .apply(summarize_metrics)
+        .reset_index()
+    )
+    overall.insert(0, "station_slug", "ALL_STATIONS")
+
+    result = pd.concat([by_station, overall], ignore_index=True)
+    result = result.sort_values(["station_slug", "noon_source", "imputation_method"]).reset_index(drop=True)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    result.to_csv(destination, index=False)
+    logger.info("Wrote noon-source stratified FWI validation summary: %s", destination)
+    return True
 
 
 def determine_spring_start_date(
-    daily_inputs: Dict[str, Dict[str, float]],
+    daily_inputs: Dict[str, Dict[str, object]],
     *,
     year: int,
     fallback_date: date,
@@ -1240,7 +1514,7 @@ def calculate_overwintering_ffmc_dmc(
 
 
 def build_fwi_daily_driver_table(
-    daily_inputs: Dict[str, Dict[str, float]],
+    daily_inputs: Dict[str, Dict[str, object]],
     *,
     start_date: date,
     end_date: date,
@@ -1259,13 +1533,17 @@ def build_fwi_daily_driver_table(
                     "h": float(values["h"]),
                     "w": float(values["w"]),
                     "p": float(values["p"]),
+                    "noon_source": str(values.get("noon_source", "observed_12")),
+                    "noon_hour_used": str(values.get("noon_hour_used", "12")),
                 }
             )
         observed_df = pd.DataFrame(observed_rows)
     else:
-        observed_df = pd.DataFrame(columns=["date", "t", "h", "w", "p"])
+        observed_df = pd.DataFrame(columns=["date", "t", "h", "w", "p", "noon_source", "noon_hour_used"])
 
     driver = base.merge(observed_df, on="date", how="left")
+    driver["noon_source"] = driver["noon_source"].fillna("missing_noon")
+    driver["noon_hour_used"] = driver["noon_hour_used"].fillna("")
 
     for variable in ("t", "h", "w", "p"):
         driver[f"{variable}_observed"] = driver[variable].notna()
@@ -1343,7 +1621,7 @@ def load_observed_fwi_seed(
 
 
 def compute_fwi_daily_records(
-    daily_inputs: Dict[str, Dict[str, float]],
+    daily_inputs: Dict[str, Dict[str, object]],
     *,
     start_date: date,
     end_date: date,
@@ -1387,6 +1665,8 @@ def compute_fwi_daily_records(
                     "fwi_valid": False,
                     "imputed_day": bool(row["imputed_day"]),
                     "imputation_method": str(row["imputation_method"]),
+                    "noon_source": str(row["noon_source"]),
+                    "noon_hour_used": str(row["noon_hour_used"]),
                 }
             )
             continue
@@ -1418,6 +1698,8 @@ def compute_fwi_daily_records(
                 "fwi_valid": True,
                 "imputed_day": bool(row["imputed_day"]),
                 "imputation_method": str(row["imputation_method"]),
+                "noon_source": str(row["noon_source"]),
+                "noon_hour_used": str(row["noon_hour_used"]),
             }
         )
 
@@ -1476,7 +1758,15 @@ def compute_stanhope_fwi_daily_file(
     if not records:
         return STATUS_FAILED_DOWNLOAD, 0, "", "No hourly API records returned for requested period.", None, None
 
-    daily_inputs = extract_daily_fwi_inputs(records)
+    log_local_date_offset_diagnostics(records, logger)
+
+    daily_inputs, noon_audit_rows = extract_daily_fwi_inputs(records)
+    write_noon_source_yearly_summary(
+        station_name=station_name,
+        year=year,
+        noon_audit_rows=noon_audit_rows,
+        destination=LOGS_DIR / "04_fwi_noon_source_counts.csv",
+    )
     if not daily_inputs:
         return STATUS_FAILED_READ, 0, "", "No complete daily noon inputs found to compute FWI.", None, None
 
@@ -2875,6 +3165,12 @@ def main() -> int:
         logger.info("Wrote missingness: %s", output_missingness)
         logger.info("Wrote QC counts: %s", output_qc_counts)
         logger.info("Wrote precip log: %s", output_precip_log)
+        write_fwi_validation_by_noon_source(
+            station_daily_path=MODEL_FWI_DAILY_TABLE,
+            observed_daily_dir=ECCC_FWI_CACHE_DIR,
+            destination=MODEL_FWI_VALIDATION_BY_NOON_TABLE,
+            logger=logger,
+        )
 
     variable_labels = {
         "air_temperature_c": "Air temperature",
