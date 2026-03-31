@@ -122,6 +122,9 @@ FWI_SEASON_END_DAY = 30
 FFMC_START = 85.0
 DMC_START = 6.0
 DC_START = 15.0
+FWI_DYNAMIC_START_THRESHOLD_C = 12.0
+FWI_DYNAMIC_START_CONSECUTIVE_DAYS = 3
+FWI_SPRING_START_FALLBACK = "june1"
 FWI_CONTINUOUS_INTERPOLATION_LIMIT_DAYS = 2
 FWI_PRECIP_ZERO_FILL_MAX_GAP_DAYS = 2
 
@@ -1027,6 +1030,215 @@ def extract_daily_fwi_inputs(records: List[Dict[str, object]]) -> Dict[str, Dict
     return daily
 
 
+def determine_spring_start_date(
+    daily_inputs: Dict[str, Dict[str, float]],
+    *,
+    year: int,
+    fallback_date: date,
+    logger: logging.Logger,
+    threshold_c: float = FWI_DYNAMIC_START_THRESHOLD_C,
+    required_consecutive_days: int = FWI_DYNAMIC_START_CONSECUTIVE_DAYS,
+    fallback_strategy: str = FWI_SPRING_START_FALLBACK,
+) -> date:
+    """Determine spring startup date using observed noon temperatures only."""
+    if required_consecutive_days < 1:
+        raise ValueError("required_consecutive_days must be >= 1")
+
+    season_search_start = date(year, 1, 1)
+    observed_temps: Dict[date, float] = {}
+    for date_text, values in daily_inputs.items():
+        current = date.fromisoformat(date_text)
+        if current.year != year:
+            continue
+        temp_val = values.get("t")
+        if temp_val is None:
+            continue
+        observed_temps[current] = float(temp_val)
+
+    streak = 0
+    previous_day: Optional[date] = None
+    for current in pd.date_range(start=season_search_start, end=fallback_date, freq="D"):
+        current_day = current.date()
+        temp = observed_temps.get(current_day)
+        if temp is None or temp < threshold_c:
+            streak = 0
+            previous_day = current_day
+            continue
+        if previous_day is not None and current_day != previous_day + timedelta(days=1):
+            streak = 0
+        streak += 1
+        previous_day = current_day
+        if streak >= required_consecutive_days:
+            logger.info(
+                "Dynamic spring startup detected for %s on %s using threshold %.1fC over %s consecutive observed noon days.",
+                year,
+                current_day.isoformat(),
+                threshold_c,
+                required_consecutive_days,
+            )
+            return current_day
+
+    if fallback_strategy == "first_observed":
+        candidates = sorted(day for day in observed_temps if day <= fallback_date)
+        if candidates:
+            selected = candidates[0]
+            logger.warning(
+                "Dynamic spring startup criterion not met for %s; using first observed noon day fallback: %s",
+                year,
+                selected.isoformat(),
+            )
+            return selected
+
+    logger.warning(
+        "Dynamic spring startup criterion not met for %s; falling back to fixed season start: %s",
+        year,
+        fallback_date.isoformat(),
+    )
+    return fallback_date
+
+
+def load_previous_fall_dc(
+    *,
+    station_name: str,
+    year: int,
+    logger: logging.Logger,
+) -> Optional[float]:
+    """Read prior fall closing DC from observed daily FWI cache if available."""
+    prior_year = year - 1
+    prior_file = ECCC_FWI_CACHE_DIR / f"ECCC_{station_slug(station_name)}_{prior_year}_daily_fwi.csv"
+    if not prior_file.exists():
+        return None
+
+    fall_stop = date(prior_year, FWI_SEASON_END_MONTH, FWI_SEASON_END_DAY)
+    try:
+        frame = pd.read_csv(prior_file, usecols=["Date", "DC"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unable to read prior fall DC file %s: %s", prior_file, exc)
+        return None
+
+    frame["Date"] = pd.to_datetime(frame["Date"], format="%Y-%m-%d", errors="coerce").dt.date
+    row = frame.loc[frame["Date"] == fall_stop]
+    if row.empty:
+        return None
+
+    dc_val = pd.to_numeric(row["DC"], errors="coerce").iloc[0]
+    if pd.isna(dc_val):
+        return None
+    return float(dc_val)
+
+
+def load_previous_fall_ffmc_dmc(
+    *,
+    station_name: str,
+    year: int,
+    logger: logging.Logger,
+) -> Optional[Tuple[float, float]]:
+    """Read prior fall closing FFMC and DMC from observed daily FWI cache if available."""
+    prior_year = year - 1
+    prior_file = ECCC_FWI_CACHE_DIR / f"ECCC_{station_slug(station_name)}_{prior_year}_daily_fwi.csv"
+    if not prior_file.exists():
+        return None
+
+    fall_stop = date(prior_year, FWI_SEASON_END_MONTH, FWI_SEASON_END_DAY)
+    try:
+        frame = pd.read_csv(prior_file, usecols=["Date", "FFMC", "DMC"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unable to read prior fall FFMC/DMC file %s: %s", prior_file, exc)
+        return None
+
+    frame["Date"] = pd.to_datetime(frame["Date"], format="%Y-%m-%d", errors="coerce").dt.date
+    row = frame.loc[frame["Date"] == fall_stop]
+    if row.empty:
+        return None
+
+    ffmc_val = pd.to_numeric(row["FFMC"], errors="coerce").iloc[0]
+    dmc_val = pd.to_numeric(row["DMC"], errors="coerce").iloc[0]
+    if pd.isna(ffmc_val) or pd.isna(dmc_val):
+        return None
+    return float(ffmc_val), float(dmc_val)
+
+
+def sum_overwinter_precip_mm(
+    *,
+    climate_id: int | str,
+    start_date: date,
+    end_date: date,
+    logger: logging.Logger,
+) -> Optional[float]:
+    """Sum local-hourly precipitation between fall stop and spring startup windows."""
+    if end_date < start_date:
+        return None
+
+    start_dt = f"{start_date:%Y-%m-%d}T00:00:00"
+    end_dt = f"{end_date:%Y-%m-%d}T23:59:59"
+    try:
+        records = fetch_hourly_range(climate_id=climate_id, start_dt=start_dt, end_dt=end_dt, logger=logger)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unable to fetch overwinter precipitation window (%s to %s): %s", start_date, end_date, exc)
+        return None
+
+    precip_total = 0.0
+    for feature in records:
+        properties = feature.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        precip = properties.get("PRECIP_AMOUNT")
+        if precip is None:
+            continue
+        try:
+            precip_total += float(precip)
+        except Exception:  # noqa: BLE001
+            continue
+    return precip_total
+
+
+def calculate_overwintering_dc(
+    *,
+    last_fall_dc: float,
+    winter_precip_mm: float,
+    drying_factor: float,
+    wetting_efficiency: float,
+) -> float:
+    """Estimate spring startup DC from prior fall DC and overwinter precipitation.
+
+    This implementation is intentionally parameterized to avoid hardcoding regional
+    constants without explicit citation. The applied moisture-store formulation is:
+    - Q_fall = 800 * exp(-DC_fall / 400)
+    - Q_spring = drying_factor * Q_fall + wetting_efficiency * P_winter
+    - DC_spring = 400 * ln(800 / Q_spring)
+    """
+    if drying_factor < 0 or wetting_efficiency < 0:
+        raise ValueError("Overwinter parameters must be non-negative.")
+
+    q_fall = 800.0 * math.exp(-last_fall_dc / 400.0)
+    q_spring = drying_factor * q_fall + wetting_efficiency * max(winter_precip_mm, 0.0)
+    q_spring = min(max(q_spring, 1e-6), 800.0)
+    dc_spring = 400.0 * math.log(800.0 / q_spring)
+    return max(dc_spring, 0.0)
+
+
+def calculate_overwintering_ffmc_dmc(
+    *,
+    last_fall_ffmc: float,
+    last_fall_dmc: float,
+    ffmc_decay: float,
+    dmc_decay: float,
+    ffmc_floor: float = 0.0,
+    dmc_floor: float = 0.0,
+) -> Tuple[float, float]:
+    """Estimate spring startup FFMC/DMC from prior fall values using explicit decay parameters.
+
+    This is a parameterized carryover policy so no uncited regional constants are
+    hardcoded. Users must provide decay factors explicitly when this mode is enabled.
+    """
+    if ffmc_decay < 0 or dmc_decay < 0:
+        raise ValueError("FFMC/DMC decay parameters must be non-negative.")
+
+    ffmc_start = max(ffmc_floor, last_fall_ffmc * ffmc_decay)
+    dmc_start = max(dmc_floor, last_fall_dmc * dmc_decay)
+    return ffmc_start, dmc_start
+
+
 def build_fwi_daily_driver_table(
     daily_inputs: Dict[str, Dict[str, float]],
     *,
@@ -1086,16 +1298,62 @@ def build_fwi_daily_driver_table(
     return driver
 
 
+def load_observed_fwi_seed(
+    *,
+    station_name: str,
+    year: int,
+    seed_date: date,
+    logger: logging.Logger,
+) -> Optional[Tuple[Dict[str, float], str]]:
+    """Load observed startup FFMC/DMC/DC values for the first modeled day when available."""
+    seed_file = ECCC_FWI_CACHE_DIR / f"ECCC_{station_slug(station_name)}_{year}_daily_fwi.csv"
+    if not seed_file.exists():
+        return None
+
+    try:
+        frame = pd.read_csv(seed_file, usecols=["Date", "FFMC", "DMC", "DC"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unable to read observed FWI seed file %s: %s", seed_file, exc)
+        return None
+
+    frame["Date"] = pd.to_datetime(frame["Date"], format="%Y-%m-%d", errors="coerce").dt.date
+    row = frame.loc[frame["Date"] == seed_date]
+    if row.empty:
+        return None
+
+    ffmc = pd.to_numeric(row["FFMC"], errors="coerce").iloc[0]
+    dmc = pd.to_numeric(row["DMC"], errors="coerce").iloc[0]
+    dc = pd.to_numeric(row["DC"], errors="coerce").iloc[0]
+
+    if pd.isna(ffmc) or pd.isna(dmc) or pd.isna(dc):
+        logger.warning(
+            "Observed FWI seed row exists for %s but has missing FFMC/DMC/DC values.",
+            seed_date.isoformat(),
+        )
+        return None
+
+    return (
+        {
+            "ffmc": float(ffmc),
+            "dmc": float(dmc),
+            "dc": float(dc),
+        },
+        str(seed_file),
+    )
+
+
 def compute_fwi_daily_records(
     daily_inputs: Dict[str, Dict[str, float]],
     *,
     start_date: date,
     end_date: date,
+    initial_codes: Optional[Dict[str, float]] = None,
+    season_start_date: Optional[date] = None,
 ) -> List[Dict[str, object]]:
     """Run sequential daily FWI calculations over a continuous daily driver timeline."""
-    ffmc_value = FFMC_START
-    dmc_value = DMC_START
-    dc_value = DC_START
+    ffmc_value = float(initial_codes.get("ffmc", FFMC_START)) if initial_codes else FFMC_START
+    dmc_value = float(initial_codes.get("dmc", DMC_START)) if initial_codes else DMC_START
+    dc_value = float(initial_codes.get("dc", DC_START)) if initial_codes else DC_START
     results: List[Dict[str, object]] = []
     driver = build_fwi_daily_driver_table(daily_inputs, start_date=start_date, end_date=end_date)
     season_invalid = False
@@ -1103,6 +1361,8 @@ def compute_fwi_daily_records(
     for _, row in driver.iterrows():
         current_day = row["date"].date()
         date_text = current_day.isoformat()
+        if season_start_date is not None and current_day < season_start_date:
+            continue
         season_end = date(current_day.year, FWI_SEASON_END_MONTH, FWI_SEASON_END_DAY)
         if current_day > season_end:
             continue
@@ -1191,6 +1451,16 @@ def compute_stanhope_fwi_daily_file(
     end_date: date,
     destination: Path,
     logger: logging.Logger,
+    dynamic_spring_start: bool = False,
+    spring_start_threshold_c: float = FWI_DYNAMIC_START_THRESHOLD_C,
+    spring_start_consecutive_days: int = FWI_DYNAMIC_START_CONSECUTIVE_DAYS,
+    spring_start_fallback: str = FWI_SPRING_START_FALLBACK,
+    enable_overwinter_dc: bool = False,
+    overwinter_drying_factor: Optional[float] = None,
+    overwinter_wetting_efficiency: Optional[float] = None,
+    enable_overwinter_ffmc_dmc: bool = False,
+    overwinter_ffmc_decay: Optional[float] = None,
+    overwinter_dmc_decay: Optional[float] = None,
 ) -> Tuple[str, int, str, Optional[str], Optional[str], Optional[List[str]]]:
     """Compute one year of Stanhope daily FWI and save to CSV with schema checks."""
     start_dt = f"{start_date:%Y-%m-%d}T00:00:00"
@@ -1210,10 +1480,139 @@ def compute_stanhope_fwi_daily_file(
     if not daily_inputs:
         return STATUS_FAILED_READ, 0, "", "No complete daily noon inputs found to compute FWI.", None, None
 
+    effective_start = start_date
+    if dynamic_spring_start:
+        effective_start = determine_spring_start_date(
+            daily_inputs,
+            year=year,
+            fallback_date=start_date,
+            logger=logger,
+            threshold_c=spring_start_threshold_c,
+            required_consecutive_days=spring_start_consecutive_days,
+            fallback_strategy=spring_start_fallback,
+        )
+
+    seed_payload = load_observed_fwi_seed(
+        station_name=station_name,
+        year=year,
+        seed_date=effective_start,
+        logger=logger,
+    )
+    if seed_payload:
+        initial_codes, seed_source = seed_payload
+        logger.info(
+            "FWI initialization for %s uses observed seed from %s on %s: FFMC=%.2f DMC=%.2f DC=%.2f",
+            year,
+            seed_source,
+            effective_start.isoformat(),
+            initial_codes["ffmc"],
+            initial_codes["dmc"],
+            initial_codes["dc"],
+        )
+    else:
+        initial_codes = {"ffmc": FFMC_START, "dmc": DMC_START, "dc": DC_START}
+        startup_adjusted = False
+
+        if enable_overwinter_ffmc_dmc:
+            if overwinter_ffmc_decay is None or overwinter_dmc_decay is None:
+                raise ValueError(
+                    "Overwinter FFMC/DMC enabled but required parameters are missing: "
+                    "overwinter_ffmc_decay and overwinter_dmc_decay."
+                )
+
+            prior_ffmc_dmc = load_previous_fall_ffmc_dmc(station_name=station_name, year=year, logger=logger)
+            if prior_ffmc_dmc is not None:
+                last_fall_ffmc, last_fall_dmc = prior_ffmc_dmc
+                ffmc_start, dmc_start = calculate_overwintering_ffmc_dmc(
+                    last_fall_ffmc=last_fall_ffmc,
+                    last_fall_dmc=last_fall_dmc,
+                    ffmc_decay=overwinter_ffmc_decay,
+                    dmc_decay=overwinter_dmc_decay,
+                )
+                initial_codes["ffmc"] = ffmc_start
+                initial_codes["dmc"] = dmc_start
+                startup_adjusted = True
+                logger.info(
+                    "FWI initialization for %s uses overwinter FFMC/DMC on %s: "
+                    "prior_fall_ffmc=%.2f prior_fall_dmc=%.2f ffmc_start=%.2f dmc_start=%.2f",
+                    year,
+                    effective_start.isoformat(),
+                    last_fall_ffmc,
+                    last_fall_dmc,
+                    ffmc_start,
+                    dmc_start,
+                )
+            else:
+                logger.warning(
+                    "Overwinter FFMC/DMC enabled for %s but prior fall FFMC/DMC values were unavailable.",
+                    year,
+                )
+
+        if enable_overwinter_dc:
+            if overwinter_drying_factor is None or overwinter_wetting_efficiency is None:
+                raise ValueError(
+                    "Overwinter DC enabled but required parameters are missing: "
+                    "overwinter_drying_factor and overwinter_wetting_efficiency."
+                )
+
+            last_fall_dc = load_previous_fall_dc(station_name=station_name, year=year, logger=logger)
+            if last_fall_dc is not None:
+                winter_start = date(year - 1, 10, 1)
+                winter_end = effective_start
+                winter_precip_mm = sum_overwinter_precip_mm(
+                    climate_id=climate_id,
+                    start_date=winter_start,
+                    end_date=winter_end,
+                    logger=logger,
+                )
+                if winter_precip_mm is not None:
+                    overwinter_dc = calculate_overwintering_dc(
+                        last_fall_dc=last_fall_dc,
+                        winter_precip_mm=winter_precip_mm,
+                        drying_factor=overwinter_drying_factor,
+                        wetting_efficiency=overwinter_wetting_efficiency,
+                    )
+                    initial_codes["dc"] = overwinter_dc
+                    startup_adjusted = True
+                    logger.info(
+                        "FWI initialization for %s uses overwinter DC on %s: prior_fall_dc=%.2f winter_precip_mm=%.2f dc_start=%.2f",
+                        year,
+                        effective_start.isoformat(),
+                        last_fall_dc,
+                        winter_precip_mm,
+                        overwinter_dc,
+                    )
+            else:
+                logger.warning(
+                    "Overwinter DC enabled for %s but prior fall DC value was unavailable.",
+                    year,
+                )
+
+        if startup_adjusted:
+            logger.info(
+                "FWI initialization for %s final startup values on %s: FFMC=%.2f DMC=%.2f DC=%.2f",
+                year,
+                effective_start.isoformat(),
+                initial_codes["ffmc"],
+                initial_codes["dmc"],
+                initial_codes["dc"],
+            )
+        else:
+            logger.info(
+                "FWI initialization for %s falls back to static startup values on %s: FFMC=%.2f DMC=%.2f DC=%.2f",
+                year,
+                effective_start.isoformat(),
+                FFMC_START,
+                DMC_START,
+                DC_START,
+            )
+
     results = compute_fwi_daily_records(
         daily_inputs,
         start_date=start_date,
         end_date=end_date,
+        initial_codes=initial_codes,
+        season_start_date=effective_start,
     )
     if not results:
         return STATUS_FAILED_READ, 0, "", "FWI computation produced no records.", None, None
@@ -1243,6 +1642,16 @@ def download_eccc_fwi_daily_periods(
     end_date: date,
     logger: logging.Logger,
     dry_run: bool,
+    dynamic_spring_start: bool = False,
+    spring_start_threshold_c: float = FWI_DYNAMIC_START_THRESHOLD_C,
+    spring_start_consecutive_days: int = FWI_DYNAMIC_START_CONSECUTIVE_DAYS,
+    spring_start_fallback: str = FWI_SPRING_START_FALLBACK,
+    enable_overwinter_dc: bool = False,
+    overwinter_drying_factor: Optional[float] = None,
+    overwinter_wetting_efficiency: Optional[float] = None,
+    enable_overwinter_ffmc_dmc: bool = False,
+    overwinter_ffmc_decay: Optional[float] = None,
+    overwinter_dmc_decay: Optional[float] = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     """Create/update annual Stanhope daily FWI files and their manifest rows."""
     manifest_rows: List[Dict[str, object]] = []
@@ -1253,7 +1662,7 @@ def download_eccc_fwi_daily_periods(
         file_name = f"ECCC_{station_slug(station_name)}_{period}_daily_fwi.csv"
         destination = ECCC_FWI_CACHE_DIR / file_name
 
-        year_start = date(year, FWI_SEASON_START_MONTH, FWI_SEASON_START_DAY)
+        year_start = date(year, 1, 1) if dynamic_spring_start else date(year, FWI_SEASON_START_MONTH, FWI_SEASON_START_DAY)
         season_end = date(year, FWI_SEASON_END_MONTH, FWI_SEASON_END_DAY)
         year_end = min(season_end, end_date)
 
@@ -1321,6 +1730,16 @@ def download_eccc_fwi_daily_periods(
                 end_date=year_end,
                 destination=destination,
                 logger=logger,
+                dynamic_spring_start=dynamic_spring_start,
+                spring_start_threshold_c=spring_start_threshold_c,
+                spring_start_consecutive_days=spring_start_consecutive_days,
+                spring_start_fallback=spring_start_fallback,
+                enable_overwinter_dc=enable_overwinter_dc,
+                overwinter_drying_factor=overwinter_drying_factor,
+                overwinter_wetting_efficiency=overwinter_wetting_efficiency,
+                enable_overwinter_ffmc_dmc=enable_overwinter_ffmc_dmc,
+                overwinter_ffmc_decay=overwinter_ffmc_decay,
+                overwinter_dmc_decay=overwinter_dmc_decay,
             )
 
         if schema_hash and columns:
@@ -1399,6 +1818,16 @@ def run_obtain(
     start_year: Optional[int],
     end_year: Optional[int],
     skip_eccc_download: bool,
+    fwi_dynamic_start: bool,
+    fwi_spring_start_temp_c: float,
+    fwi_spring_start_consecutive_days: int,
+    fwi_spring_fallback: str,
+    fwi_enable_overwinter_dc: bool,
+    fwi_overwinter_drying_factor: Optional[float],
+    fwi_overwinter_wetting_efficiency: Optional[float],
+    fwi_enable_overwinter_ffmc_dmc: bool,
+    fwi_overwinter_ffmc_decay: Optional[float],
+    fwi_overwinter_dmc_decay: Optional[float],
 ) -> pd.DataFrame:
     """Build source inventory and manifests used as the scrub stage input contract."""
     manifest_dir.mkdir(parents=True, exist_ok=True)
@@ -1561,6 +1990,16 @@ def run_obtain(
             end_date=fwi_end_date,
             logger=logger,
             dry_run=dry_run,
+            dynamic_spring_start=fwi_dynamic_start,
+            spring_start_threshold_c=fwi_spring_start_temp_c,
+            spring_start_consecutive_days=fwi_spring_start_consecutive_days,
+            spring_start_fallback=fwi_spring_fallback,
+            enable_overwinter_dc=fwi_enable_overwinter_dc,
+            overwinter_drying_factor=fwi_overwinter_drying_factor,
+            overwinter_wetting_efficiency=fwi_overwinter_wetting_efficiency,
+            enable_overwinter_ffmc_dmc=fwi_enable_overwinter_ffmc_dmc,
+            overwinter_ffmc_decay=fwi_overwinter_ffmc_decay,
+            overwinter_dmc_decay=fwi_overwinter_dmc_decay,
         )
         fwi_rows.extend(downloaded_fwi_rows)
         schema_records.extend(downloaded_fwi_schema_rows)
@@ -2291,6 +2730,64 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--force", action="store_true", help="Overwrite existing outputs if present.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and summarize without writing files.")
+    parser.add_argument(
+        "--fwi-dynamic-start",
+        action="store_true",
+        help="Enable dynamic spring startup date (3 consecutive observed noon days >= threshold).",
+    )
+    parser.add_argument(
+        "--fwi-spring-start-temp-c",
+        type=float,
+        default=FWI_DYNAMIC_START_THRESHOLD_C,
+        help="Noon temperature threshold in C used to detect dynamic spring startup.",
+    )
+    parser.add_argument(
+        "--fwi-spring-start-consecutive-days",
+        type=int,
+        default=FWI_DYNAMIC_START_CONSECUTIVE_DAYS,
+        help="Required count of consecutive observed noon days meeting spring startup threshold.",
+    )
+    parser.add_argument(
+        "--fwi-spring-fallback",
+        type=str,
+        choices=["june1", "first_observed"],
+        default=FWI_SPRING_START_FALLBACK,
+        help="Fallback strategy when dynamic spring criterion is not met.",
+    )
+    parser.add_argument(
+        "--fwi-enable-overwinter-dc",
+        action="store_true",
+        help="Enable parameterized overwinter DC carryover when observed startup seed is unavailable.",
+    )
+    parser.add_argument(
+        "--fwi-overwinter-drying-factor",
+        type=float,
+        default=None,
+        help="Overwinter DC drying factor parameter (must be explicitly set when overwinter DC is enabled).",
+    )
+    parser.add_argument(
+        "--fwi-overwinter-wetting-efficiency",
+        type=float,
+        default=None,
+        help="Overwinter DC wetting efficiency parameter (must be explicitly set when overwinter DC is enabled).",
+    )
+    parser.add_argument(
+        "--fwi-enable-overwinter-ffmc-dmc",
+        action="store_true",
+        help="Enable parameterized overwinter FFMC/DMC carryover when observed startup seed is unavailable.",
+    )
+    parser.add_argument(
+        "--fwi-overwinter-ffmc-decay",
+        type=float,
+        default=None,
+        help="Overwinter FFMC decay parameter (must be set when FFMC/DMC overwinter mode is enabled).",
+    )
+    parser.add_argument(
+        "--fwi-overwinter-dmc-decay",
+        type=float,
+        default=None,
+        help="Overwinter DMC decay parameter (must be set when FFMC/DMC overwinter mode is enabled).",
+    )
     return parser.parse_args()
 
 
@@ -2320,6 +2817,20 @@ def main() -> int:
         logger.info("Overwrite mode is default; existing scrubbed outputs/manifests will be replaced.")
 
     logger.info("Step A (obtain): discovering local files and building manifests.")
+    if args.fwi_enable_overwinter_dc and (
+        args.fwi_overwinter_drying_factor is None or args.fwi_overwinter_wetting_efficiency is None
+    ):
+        raise ValueError(
+            "--fwi-enable-overwinter-dc requires both --fwi-overwinter-drying-factor and "
+            "--fwi-overwinter-wetting-efficiency to be set."
+        )
+    if args.fwi_enable_overwinter_ffmc_dmc and (
+        args.fwi_overwinter_ffmc_decay is None or args.fwi_overwinter_dmc_decay is None
+    ):
+        raise ValueError(
+            "--fwi-enable-overwinter-ffmc-dmc requires both --fwi-overwinter-ffmc-decay and "
+            "--fwi-overwinter-dmc-decay to be set."
+        )
     inventory = run_obtain(
         raw_dir=raw_dir,
         manifest_dir=manifest_dir,
@@ -2328,6 +2839,16 @@ def main() -> int:
         start_year=args.start_year,
         end_year=args.end_year,
         skip_eccc_download=args.skip_eccc_download,
+        fwi_dynamic_start=args.fwi_dynamic_start,
+        fwi_spring_start_temp_c=args.fwi_spring_start_temp_c,
+        fwi_spring_start_consecutive_days=args.fwi_spring_start_consecutive_days,
+        fwi_spring_fallback=args.fwi_spring_fallback,
+        fwi_enable_overwinter_dc=args.fwi_enable_overwinter_dc,
+        fwi_overwinter_drying_factor=args.fwi_overwinter_drying_factor,
+        fwi_overwinter_wetting_efficiency=args.fwi_overwinter_wetting_efficiency,
+        fwi_enable_overwinter_ffmc_dmc=args.fwi_enable_overwinter_ffmc_dmc,
+        fwi_overwinter_ffmc_decay=args.fwi_overwinter_ffmc_decay,
+        fwi_overwinter_dmc_decay=args.fwi_overwinter_dmc_decay,
     )
 
     logger.info("Step B (scrub): parsing, UTC normalization, QC, fill<=2h, hourly aggregation.")
