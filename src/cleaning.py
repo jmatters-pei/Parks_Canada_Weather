@@ -62,6 +62,7 @@ OUTPUT_MISSINGNESS = SCRUBBED_DIR / "02_missingness_hourly_summary.csv"
 OUTPUT_QC_COUNTS = SCRUBBED_DIR / "02_qc_out_of_range_counts.csv"
 OUTPUT_PRECIP_LOG = SCRUBBED_DIR / "02_precip_semantics_log.csv"
 SCRUB_RUNS_MANIFEST = MANIFEST_DIR / "02_scrub_runs.csv"
+OUTPUT_WIND_10M_LOG = LOGS_DIR / "04_fwi_wind_10m_adjustments.csv"
 
 MANIFEST_COLUMNS = [
     "source",
@@ -136,6 +137,12 @@ RH_CAP_MAX = 100.0
 RH_SOFT_MAX = 105.0
 WIND_SPEED_MIN = 0.0
 WIND_DIR_BOUNDS = (0.0, 360.0)
+WIND_SPEED_CANONICAL_RAW = "wind_speed_kmh_raw"
+WIND_SPEED_CANONICAL_10M = "wind_speed_kmh_10m"
+WIND_TO_10M_DEFAULT_ENABLED = True
+WIND_TO_10M_HOBO_HEIGHT_M = 2.0
+WIND_TO_10M_TARGET_HEIGHT_M = 10.0
+WIND_TO_10M_POWER_ALPHA = 0.14
 
 STEP_THRESHOLDS = {
     CANONICAL_VARIABLES["temp"]: 15.0,
@@ -2627,6 +2634,96 @@ def aggregate_hourly(df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
+def compute_wind_speed_10m(
+    wind_speed_kmh: pd.Series,
+    *,
+    wind_height_m: float,
+    method: str = "power_law",
+    alpha: float = WIND_TO_10M_POWER_ALPHA,
+    factor: Optional[float] = None,
+) -> pd.Series:
+    """Convert measured wind speed to 10m equivalent wind speed in km/h."""
+    wind = pd.to_numeric(wind_speed_kmh, errors="coerce")
+    if method == "factor":
+        if factor is None or factor <= 0:
+            raise ValueError("factor method requires factor > 0")
+        return wind * float(factor)
+
+    if method != "power_law":
+        raise ValueError(f"Unsupported wind conversion method: {method}")
+    if wind_height_m <= 0 or WIND_TO_10M_TARGET_HEIGHT_M <= 0:
+        raise ValueError("Wind heights must be positive.")
+
+    scale = (WIND_TO_10M_TARGET_HEIGHT_M / float(wind_height_m)) ** float(alpha)
+    return wind * scale
+
+
+def adjust_station_wind_to_10m(
+    station_df: pd.DataFrame,
+    *,
+    apply_wind_to_10m: bool = WIND_TO_10M_DEFAULT_ENABLED,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    """Preserve raw wind and derive 10m wind according to station metadata assumptions."""
+    if station_df.empty:
+        return station_df, {}
+
+    df = station_df.copy()
+    ws_col = CANONICAL_VARIABLES["wind_speed"]
+    station = str(df["station_slug"].iloc[0])
+    source = str(df["source"].iloc[0]).strip().lower()
+    year_min = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce").min()
+    year_max = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce").max()
+
+    df[WIND_SPEED_CANONICAL_RAW] = pd.to_numeric(df[ws_col], errors="coerce")
+    df[WIND_SPEED_CANONICAL_10M] = df[WIND_SPEED_CANONICAL_RAW]
+
+    method = "none"
+    alpha_value = pd.NA
+    factor_value = 1.0
+    wind_height_m = pd.NA
+    applied_rows = 0
+
+    is_hobolink = source == "hobolink"
+    should_adjust = apply_wind_to_10m and is_hobolink
+    if should_adjust:
+        method = "power_law"
+        alpha_value = WIND_TO_10M_POWER_ALPHA
+        wind_height_m = WIND_TO_10M_HOBO_HEIGHT_M
+        factor_value = (WIND_TO_10M_TARGET_HEIGHT_M / WIND_TO_10M_HOBO_HEIGHT_M) ** WIND_TO_10M_POWER_ALPHA
+        converted = compute_wind_speed_10m(
+            df[WIND_SPEED_CANONICAL_RAW],
+            wind_height_m=WIND_TO_10M_HOBO_HEIGHT_M,
+            method=method,
+            alpha=WIND_TO_10M_POWER_ALPHA,
+        )
+        mask = df[WIND_SPEED_CANONICAL_RAW].notna()
+        df.loc[mask, WIND_SPEED_CANONICAL_10M] = converted[mask]
+        applied_rows = int(mask.sum())
+
+    df[ws_col] = df[WIND_SPEED_CANONICAL_10M]
+
+    consistency_mask = df[WIND_SPEED_CANONICAL_RAW].notna() & df[WIND_SPEED_CANONICAL_10M].notna()
+    consistency_violations = int((df.loc[consistency_mask, WIND_SPEED_CANONICAL_10M] < df.loc[consistency_mask, WIND_SPEED_CANONICAL_RAW]).sum())
+
+    log_row: Dict[str, object] = {
+        "station_slug": station,
+        "source": source,
+        "wind_to_10m_applied": bool(should_adjust),
+        "method": method,
+        "wind_height_m": wind_height_m,
+        "target_height_m": WIND_TO_10M_TARGET_HEIGHT_M,
+        "alpha": alpha_value,
+        "factor": float(factor_value),
+        "rows_with_raw_wind": int(df[WIND_SPEED_CANONICAL_RAW].notna().sum()),
+        "rows_adjusted": applied_rows,
+        "consistency_violations_10m_lt_raw": consistency_violations,
+        "coverage_start_utc": year_min.isoformat() if pd.notna(year_min) else pd.NA,
+        "coverage_end_utc": year_max.isoformat() if pd.notna(year_max) else pd.NA,
+        "updated_at_utc": utc_now_iso(),
+    }
+    return df, log_row
+
+
 def missing_run_lengths(mask: pd.Series) -> List[int]:
     """Return lengths of contiguous missing-value runs."""
     lengths: List[int] = []
@@ -2805,12 +2902,17 @@ def cast_output_dtypes(df: pd.DataFrame) -> pd.DataFrame:
         out[var] = pd.to_numeric(out[var], errors="coerce").astype("Float32")
         out[f"{var}_failed_qc"] = out[f"{var}_failed_qc"].astype("boolean")
         out[f"{var}_filled_short_gap"] = out[f"{var}_filled_short_gap"].astype("boolean")
+    if WIND_SPEED_CANONICAL_RAW in out.columns:
+        out[WIND_SPEED_CANONICAL_RAW] = pd.to_numeric(out[WIND_SPEED_CANONICAL_RAW], errors="coerce").astype("Float32")
+    if WIND_SPEED_CANONICAL_10M in out.columns:
+        out[WIND_SPEED_CANONICAL_10M] = pd.to_numeric(out[WIND_SPEED_CANONICAL_10M], errors="coerce").astype("Float32")
     return out
 
 
 def assert_output_schema(df: pd.DataFrame) -> None:
     """Validate final scrub schema and station-hour uniqueness contract."""
     required = ["station_raw", "station_slug", "source", "datetime_utc"] + CANONICAL_ORDER
+    required.extend([WIND_SPEED_CANONICAL_RAW, WIND_SPEED_CANONICAL_10M])
     for var in CANONICAL_ORDER:
         required.append(f"{var}_failed_qc")
         required.append(f"{var}_filled_short_gap")
@@ -2886,6 +2988,7 @@ def run_scrub(
     scrub_runs_manifest: Path,
     logger: logging.Logger,
     dry_run: bool,
+    apply_wind_to_10m: bool = WIND_TO_10M_DEFAULT_ENABLED,
 ) -> Dict[str, object]:
     """Execute parse -> normalize -> aggregate -> QC/fill -> write scrubbed artifacts."""
     if inventory.empty:
@@ -2954,14 +3057,21 @@ def run_scrub(
     station_outputs: List[pd.DataFrame] = []
     missingness_rows: List[Dict[str, object]] = []
     qc_rows: List[Dict[str, object]] = []
+    wind_adjustment_rows: List[Dict[str, object]] = []
 
     for _, station_df in hourly_all.groupby("station_slug", dropna=False):
         station_df = station_df.sort_values("datetime_utc").reset_index(drop=True)
         expanded = build_complete_hourly_grid(station_df)
         cleaned, station_qc_rows = apply_qc_and_fill(expanded)
+        cleaned, wind_adjustment_row = adjust_station_wind_to_10m(
+            cleaned,
+            apply_wind_to_10m=apply_wind_to_10m,
+        )
         station_outputs.append(cleaned)
         missingness_rows.extend(summarize_missingness(cleaned))
         qc_rows.extend(station_qc_rows)
+        if wind_adjustment_row:
+            wind_adjustment_rows.append(wind_adjustment_row)
 
     final_df = pd.concat(station_outputs, ignore_index=True)
     final_df = cast_output_dtypes(final_df)
@@ -2976,6 +3086,7 @@ def run_scrub(
         pd.DataFrame(missingness_rows).to_csv(output_missingness, index=False)
         pd.DataFrame(qc_rows).to_csv(output_qc_counts, index=False)
         pd.DataFrame(precip_log_rows).to_csv(output_precip_log, index=False)
+        pd.DataFrame(wind_adjustment_rows).to_csv(OUTPUT_WIND_10M_LOG, index=False)
 
         append_scrub_run_manifest(
             run_id=f"scrub_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}",
@@ -2992,6 +3103,8 @@ def run_scrub(
         "stations": int(final_df["station_slug"].nunique(dropna=True)),
         "date_min": final_df["datetime_utc"].min(),
         "date_max": final_df["datetime_utc"].max(),
+        "wind_10m_adjusted_stations": int(sum(bool(row.get("wind_to_10m_applied", False)) for row in wind_adjustment_rows)),
+        "wind_10m_consistency_violations": int(sum(int(row.get("consistency_violations_10m_lt_raw", 0)) for row in wind_adjustment_rows)),
         "missing_pct": {
             var: float(final_df[var].isna().mean() * 100.0)
             for var in [CANONICAL_VARIABLES["temp"], CANONICAL_VARIABLES["rh"], CANONICAL_VARIABLES["wind_speed"], CANONICAL_VARIABLES["rain"]]
@@ -3020,6 +3133,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--force", action="store_true", help="Overwrite existing outputs if present.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and summarize without writing files.")
+    parser.add_argument(
+        "--disable-wind-to-10m",
+        action="store_true",
+        help="Skip HOBOlink wind conversion to 10m equivalent and retain raw wind as canonical wind_speed_kmh.",
+    )
     parser.add_argument(
         "--fwi-dynamic-start",
         action="store_true",
@@ -3151,6 +3269,7 @@ def main() -> int:
         scrub_runs_manifest=scrub_runs_manifest,
         logger=logger,
         dry_run=args.dry_run,
+        apply_wind_to_10m=not args.disable_wind_to_10m,
     )
 
     date_min = summary["date_min"]
@@ -3158,6 +3277,11 @@ def main() -> int:
     logger.info("Cleaning completed successfully.")
     logger.info("Summary rows=%s stations=%s range=%s -> %s", summary["rows"], summary["stations"], date_min, date_max)
     logger.info("Missingness (%%): %s", summary["missing_pct"])
+    logger.info(
+        "Wind 10m conversion summary: adjusted_stations=%s consistency_violations=%s",
+        summary.get("wind_10m_adjusted_stations", 0),
+        summary.get("wind_10m_consistency_violations", 0),
+    )
     if args.dry_run:
         logger.info("Dry run mode enabled: no files were written.")
     else:
@@ -3165,6 +3289,7 @@ def main() -> int:
         logger.info("Wrote missingness: %s", output_missingness)
         logger.info("Wrote QC counts: %s", output_qc_counts)
         logger.info("Wrote precip log: %s", output_precip_log)
+        logger.info("Wrote wind conversion provenance log: %s", OUTPUT_WIND_10M_LOG)
         write_fwi_validation_by_noon_source(
             station_daily_path=MODEL_FWI_DAILY_TABLE,
             observed_daily_dir=ECCC_FWI_CACHE_DIR,
