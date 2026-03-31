@@ -9,6 +9,9 @@
 !requirements.txt
 !analysis.ipynb
 
+# Copilot instructions
+.github/copilot-instructions.md
+
 # Keep only cleaning.py under src tracked.
 !src/
 src/*
